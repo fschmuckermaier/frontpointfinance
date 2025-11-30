@@ -201,8 +201,11 @@ def run_simulation_i(starting_capital,
         c = c * (1-0.01*ter)
 
         #Account for inflation when withdrawing money:
-        inflation_rate = simulate_inflation_year(inflation_rate)
-        
+        if inflation_rate == 0:
+            pass
+        else:
+            inflation_rate = simulate_inflation_year(inflation_rate)
+            
         infl_adj_yearly_invest*=(1+0.01*inflation_rate)
         
         if c == 0 and yearly_invest <= 0:
