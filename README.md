@@ -32,9 +32,9 @@ A Monte Carlo-based simulation tool to model portfolio development over time, su
 2. Optional: Create environment:
 
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # Linux/macOS
-   .\venv\Scripts\activate   # Windows
+   python -m venv fpfinance_env
+   source fpfinance_env/bin/activate  # Linux/macOS
+   .\fpfinance_env\Scripts\activate   # Windows
    
    pip install -r requirements.txt
 
