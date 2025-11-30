@@ -1,2 +1,30 @@
-# frontpointfinance
-Monte Carlo tool to simulate portfolio growth or withdrawal scenarios. Customize starting capital, yearly cashflows, asset allocation, returns, volatility, fees, inflation, and crash risks. Interactive visualizations help explore long-term investment outcomes. Built with Python &amp; Streamlit.
+# FrontPointFinance Monte Carlo Simulator
+
+A Monte Carlo-based simulation tool to model portfolio development over time, supporting saving or withdrawing scenarios. Customize inputs like starting capital, yearly cashflows, asset allocation, returns, volatility, fees, inflation, and crash risk. Visualize investment outcomes interactively.
+
+---
+
+## Features
+
+- Run thousands of simulation paths with adjustable parameters  
+- Model stock and fixed income allocations with customizable return distributions  
+- Account for inflation, fees (TER), dividends, taxes, and crash probabilities  
+- Interactive plots showing portfolio value trajectories and distributions over time  
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.8+  
+- Streamlit  
+- Required Python packages listed in `requirements.txt`
+
+### Installation
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/yourusername/frontpointfinance.git
+   cd frontpointfinance
