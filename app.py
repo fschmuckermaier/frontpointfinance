@@ -23,7 +23,7 @@ inflation_value = st.slider("Inflation-accounted cashflow [%]", 0.0, 10.0, 0.0, 
 tax = st.slider("Capital gain tax [%]", 0, 40, 25, 1)
 
 st.header("Stock Allocation")
-st.write("<small style='color:gray'>(Default values for A1JX52)</small>", unsafe_allow_html=True)
+st.write("<small style='color:gray'>Default values for A1JX52</small>", unsafe_allow_html=True)
 
 asset_allocation = st.slider("Share of stocks [%]", 0, 100, 70, 1)
 pdf = st.selectbox("Probability density function", ["studentt", "gaussian"])
@@ -33,7 +33,7 @@ ter = st.slider("TER [%]", 0.0, 2.0, 0.2, 0.1)
 dividend = st.slider("Dividends [%]", 0.0, 3.0, 1.4, 0.1)
 
 st.header("Fixed Income Allocation")
-st.write("<small style='color:gray'>(Default values for DBX0AN)</small>", unsafe_allow_html=True)
+st.write("<small style='color:gray'>Default values for DBX0AN</small>", unsafe_allow_html=True)
 
 average_annual_return_fi = st.slider("Annual returns [%]", 0.0, 5.0, 0.5, 0.1)
 std_on_return_fi = st.slider("Standard deviation on returns [%]", 0.0, 1.0, 0.2, 0.1)
