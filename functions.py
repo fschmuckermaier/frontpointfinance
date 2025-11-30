@@ -1,8 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from ipywidgets import interact, FloatSlider, IntSlider, Layout, Dropdown
-import ipywidgets as widgets
 from scipy.stats import t, truncnorm
 import random
 
