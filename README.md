@@ -41,6 +41,7 @@ A Monte Carlo-based simulation tool to model portfolio development over time, su
 ### Run the app
 
    ```bash
-   streamlit run app.py```
+   streamlit run app.py
+   ```
 
 This will open the app in your default web browser.
