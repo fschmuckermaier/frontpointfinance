@@ -31,13 +31,15 @@ A Monte Carlo-based simulation tool to model portfolio development over time, su
 
 2. Optional: Create environment:
 
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-.\venv\Scripts\activate   # Windows
-
-pip install -r requirements.txt
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Linux/macOS
+   .\venv\Scripts\activate   # Windows
+   
+   pip install -r requirements.txt
 
 ### Run the app
 
-streamlit run app.py
+   ```bash
+   streamlit run app.py
 
