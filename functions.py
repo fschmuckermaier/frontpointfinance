@@ -7,7 +7,7 @@ from scipy.stats import t, truncnorm
 import random
 
 plt.rcParams.update({
-    'font.family': 'Source Sans Pro',   # You can use 'Arial', 'Times New Roman', 'Calibri', etc.
+    'font.family': 'Arial',   # You can use 'Arial', 'Times New Roman', 'Calibri', etc.
     'font.size': 12,
     'font.weight': 'normal',          # options: 'normal', 'bold', etc.
 })
