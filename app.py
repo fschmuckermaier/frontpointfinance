@@ -41,7 +41,7 @@ ter_fi = st.slider("TER [%]", 0.0, 1.0, 0.1, 0.05)
 
 st.header("Crash Settings")
 crash = st.checkbox("Enable crash", False)
-crash_prob = st.slider("Probability of crash (sampled from -20% to -50%) occurring in a given year [%]", 1, 10, 3, 1)
+crash_prob = st.slider("Probability of a crash (sampled from -20% to -50%) occurring in a given year [%]", 1, 10, 3, 1)
 
 st.markdown(
     """
