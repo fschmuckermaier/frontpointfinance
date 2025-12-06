@@ -123,7 +123,7 @@ if st.session_state.results is not None:
 
     st.subheader("Summary of Input Parameters")
 
-    with st.expander("Show simulation settings", expanded=False):
+    with st.expander("Show current simulation settings", expanded=False):
 
         colA, colB, colC = st.columns(3)
 
