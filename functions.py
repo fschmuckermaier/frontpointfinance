@@ -145,17 +145,17 @@ def run_simulation_i(starting_capital,
     
     for i in range(int(time)):
 
-        #Determine if crash regime or normal year first:
+        # Determine if crash regime or normal year first:
         is_crash = (np.random.rand() < 0.01 * crash_prob) and crash
 
-        #Cut dividend in crash year:
-        dividend_adj = dividend * (1 - 0.5 * is_crash)
+        # Cut dividend in crash year:
+        dividend_adj = dividend * (0.5 * is_crash)
         
-        #Dividends computed with pre-year value:
+        # Dividends computed with pre-year value:
         c_div = c * 0.01 * dividend_adj
         c_div_after_tax = c_div * (1 - 0.01 * tax) # -25% capital tax gain
         
-        #Calculate price return without dividend yield:
+        # Calculate price return without dividend yield:
         price_return = av_return - dividend_adj
         
         if is_crash:
@@ -164,24 +164,24 @@ def run_simulation_i(starting_capital,
         else:
             yr_return, current_log_ret = annual_return(pdf, price_return, std, current_log_ret, phi)
             
-        #Change due to market gains:
+        # Change due to market gains:
         c = c * yr_return 
 
-        #Check for insolvency:
+        # Check for insolvency:
         if c < 0:
             c = 0
         
-        #Changes to to investing / withdrawing money:
+        # Changes to to investing / withdrawing money:
         
         if yearly_invest > 0: #saving money
             
-            #Re-invest dividends after taxes:
+            # Re-invest dividends after taxes:
             c = c + c_div_after_tax 
 
-            #New savings:
+            # New savings:
             c = c + infl_adj_yearly_invest
             
-        else: #withdrawing money
+        else: # withdrawing money
             withdrawal = abs(infl_adj_yearly_invest)
             
             if c_div_after_tax >= withdrawal:
@@ -197,10 +197,10 @@ def run_simulation_i(starting_capital,
                 c = c - withdrawal_from_portfolio / (1 - 0.01 * tax)  
 
         
-        #Subtract TER:
+        # Subtract TER:
         c = c * (1-0.01*ter)
 
-        #Account for inflation when withdrawing money:
+        # Account for inflation when withdrawing money:
         if inflation_rate == 0:
             pass
         else:
@@ -227,7 +227,7 @@ def run_simulations(n=1000,
                     tax=25,
                     asset_allocation=70,
                     pdf="studentt",
-                    average_annual_return=5,  
+                    average_annual_return=5,
                     std_on_return=13,
                     ter=0.2,
                     dividend=1.4,
@@ -235,7 +235,8 @@ def run_simulations(n=1000,
                     std_on_return_fi=0.2,
                     ter_fi=0.1,
                     crash=False, 
-                    crash_prob=3):
+                    crash_prob=3,
+                    progress_callback=None):
     """
     Runs Monte Carlo simulations for a portfolio with stocks and fixed income.
 
@@ -259,39 +260,60 @@ def run_simulations(n=1000,
         ter_fi (float): FI total expense ratio (%).
         crash (bool): Enable crash simulation.
         crash_prob (float): Annual crash probability (%).
+        progress_callback (callable): Optional callback for progress updates (0 to 1).
 
     Returns:
         runs (np.array): Simulated portfolio values (n x (time+1)).
         comp_run (np.array): Deterministic composite portfolio run (time+1).
         capital_run (np.array): Baseline run with zero returns, only cash flows.
     """
-
-    #Compute stock development:
+    # Convert percentage:
     share_stocks=asset_allocation*0.01
-    runs_stocks=[]
-    for i in range(int(n)):
-        runs_stocks.append(run_simulation_i(share_stocks*starting_capital,time, average_annual_return,std_on_return, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax, pdf,crash, crash_prob))
-
-    comp_run_stocks=run_simulation_i(share_stocks*starting_capital,time,average_annual_return,0, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax,pdf=pdf)
-    runs_stocks=np.array(runs_stocks)
-    comp_run_stocks=np.array(comp_run_stocks)
-
-    #Compute FI development:
     share_fi=(1-share_stocks)
-    runs_fi=[]
-    for i in range(int(n)):
-        runs_fi.append(run_simulation_i(share_fi*starting_capital,time, average_annual_return_fi,std_on_return_fi, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value, tax, "gaussian",False, crash_prob))
     
-    comp_run_fi=run_simulation_i(share_fi*starting_capital,time,average_annual_return_fi, 0, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value,tax, pdf="gaussian")
-    runs_fi=np.array(runs_fi)
-    comp_run_fi=np.array(comp_run_fi)
+    # Run path with zero volatility for stocks:
+
+    #Adjust annual exp. returns if crash is enabled (Using hard-coded expected crash magnitude of -35%):
+    adjusted_average_annual_return = average_annual_return + (0.01 * crash_prob * (-35)) if crash else average_annual_return
     
-    runs = runs_stocks + runs_fi
+    comp_run_stocks=np.array(
+        run_simulation_i(share_stocks*starting_capital,time,adjusted_average_annual_return,0, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax,pdf=pdf)
+    )
+
+    # Run path with zero volatility for FI:
+    comp_run_fi=np.array(
+        run_simulation_i(share_fi*starting_capital,time,average_annual_return_fi, 0, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value,tax, pdf="gaussian")
+    )
+    
+    # Combine both assets:
     comp_run = comp_run_stocks + comp_run_fi
 
-    #Compute change of capital without any returns or volatility. Just savings or withdrawals:
+    # Compute change of capital without any returns or volatility. Just savings / withdrawals:
     capital_run = run_simulation_i(starting_capital,time,0,0,0,0,0,yearly_invest,inflation_value, tax, pdf="gaussian")
-    
+
+    # Compute portfolio development:
+    runs = []
+    for i in range(n):
+        
+        # Simulate stocks for this path
+        sim_stocks= np.array(
+            run_simulation_i(share_stocks*starting_capital,time, average_annual_return,std_on_return, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax, pdf,crash, crash_prob)
+        )
+
+        # Simulate fixed income for this path
+        sim_fi = np.array(
+            run_simulation_i(share_fi*starting_capital,time, average_annual_return_fi,std_on_return_fi, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value, tax, "gaussian",False, crash_prob)
+        )
+
+        # combine
+        runs.append(sim_stocks + sim_fi)
+
+        # Update progress bar callback if provided
+        if progress_callback is not None:
+            progress_callback((i + 1) / n)
+
+    #runs = np.array(runs)
+
     return runs, comp_run, capital_run
 
 
@@ -332,7 +354,9 @@ def plot_simulations(year,
 
     years = np.linspace(start_year, start_year + time, int(time) + 1)
     values_at_year = [run[int(year - start_year)] for run in runs]
-    
+
+    #mean = np.mean(runs, axis=0)
+
     for run in runs:        
         axs[0].plot(years,run,color='k',alpha=0.03,linewidth=0.5)
         
@@ -348,14 +372,14 @@ def plot_simulations(year,
     axs[0].legend(fontsize=12, )
     axs[0].set_xlim(start_year,start_year+time)
 
-    #Set Y-lims first:
+    # Set Y-lims first:
     hist_max=np.array([run[-1] for run in runs])
     p99 = np.percentile(hist_max, 99)
     p1 = np.percentile(hist_max, 1)
     ylim_low, ylim_high = axs[1].set_ylim(min(0.9*starting_capital,p1),max(1.1*starting_capital,p99))
     axs[0].set_ylim(min(0.9*starting_capital,p1),max(1.1*starting_capital,p99))
     
-    ### Histogram:
+    # Histogram:
     cap = np.percentile(values_at_year, 99.5)
     values_capped = np.clip(values_at_year, 0, cap)
     counts, bin_edges = np.histogram(values_capped, bins=100)
@@ -369,12 +393,14 @@ def plot_simulations(year,
     p10 = np.percentile(values_at_year, 10)
     p90 = np.percentile(values_at_year, 90)
     capital_value=int(capital_run[int(year-start_year)])
+    comp_value=int(comp_run[int(year-start_year)])
 
-    #Round up to 1000€:
+    # Round up to 1000€:
     median = int(np.ceil(median / 1000) *1000)
     p10 = int(np.ceil(p10 / 1000) *1000)
     p90 = int(np.ceil(p90 / 1000) *1000)
     capital_value = int(np.ceil(capital_run[int(year - start_year)] / 1000) *1000)
+    comp_value = int(np.ceil(comp_run[int(year - start_year)] / 1000) *1000)
 
     # Y-position to start the grouped text box
     y_start = 0.95
@@ -392,10 +418,11 @@ def plot_simulations(year,
 
     # Draw horizontal lines with matching colors and labels on right side
     line_values = {
-        "Median": (median, "navy"),
-        "10th perc.": (p10, "navy"),
-        "90th perc.": (p90, "navy"),
-        "Capital only": (capital_value, "teal"),
+        "Median": (median, "navy","-"),
+        "10th perc.": (p10, "navy","-"),
+        "90th perc.": (p90, "navy","-"),
+        "Capital only": (capital_value, "teal","-"),
+        "Exp. return": (comp_value, "k",":"),
     }
 
     # Sort labels by their original y-values
@@ -406,7 +433,7 @@ def plot_simulations(year,
 
     adjusted_positions = []
 
-    for idx, (label, (val, color)) in enumerate(sorted_labels):
+    for idx, (label, (val, color, line_st)) in enumerate(sorted_labels):
         y_pos = val
         if idx > 0:
             # Make sure current label is at least min_spacing above the previous label
@@ -416,7 +443,7 @@ def plot_simulations(year,
         
         adjusted_positions.append(y_pos)
 
-        axs[1].axhline(val, color=color, alpha=0.8, linestyle="-" if label != "Zero" else ":")
+        axs[1].axhline(val, color=color, alpha=0.8, linestyle=line_st if label != "Zero" else ":")
         axs[1].text(
             1.01, y_pos,
             f"{label} ({int(val/1000.)} k€)" if label != "Zero" else "0",
@@ -427,7 +454,7 @@ def plot_simulations(year,
             clip_on=False
         )
 
-    #Format axis:
+    # Format axis:
     axs[1].set_yticks([])
     axs[1].set_xticks([])
     axs[0].yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))

@@ -12,36 +12,36 @@ st.title("📈 FrontPointFinance Monte Carlo")
 st.header("Simulation Parameters")
 
 n = st.slider("Number of simulations", 0, 10000, 1000, 100)
-start_year = st.slider("Start [yr]", 2025, 2100, 2025, 1)
-time = st.slider("Time [yrs]", 0, 50, 20, 1)
+start_year = st.slider("Starting year of simulation", 2025, 2100, 2025, 1)
+time = st.slider("Run time of simulation [yrs]", 0, 50, 20, 1)
 
 st.header("Capital & Cashflows")
 
-starting_capital = st.slider("Seed capital [€]", 0, 2_000_000, 10_000, 1000)
-yearly_invest = st.slider("Yearly cashflow [€]", -50_000, 50_000, 0, 100)
-inflation_value = st.slider("Inflation-accounted cashflow [%]", 0.0, 10.0, 0.0, 0.1)
+starting_capital = st.slider("Starting portfolio value [€]", 0, 2_000_000, 10_000, 1000)
+yearly_invest = st.slider("Annual amount saved (+) or withdrawn (-) from the portfolio [€]", -50_000, 50_000, 0, 100)
+inflation_value = st.slider("Inflation-rate to modify yearly cashflow [%]", 0.0, 10.0, 0.0, 0.1)
 tax = st.slider("Capital gain tax [%]", 0, 40, 25, 1)
 
 st.header("Stock Allocation")
 st.write("<small style='color:gray'>Default values for A1JX52</small>", unsafe_allow_html=True)
 
 asset_allocation = st.slider("Share of stocks [%]", 0, 100, 70, 1)
-pdf = st.selectbox("Probability density function", ["studentt", "gaussian"])
-average_annual_return = st.slider("Annual total returns [%]", 0.0, 20.0, 7.0, 0.1)
-std_on_return = st.slider("Standard deviation on returns [%]", 0.0, 30.0, 16.0, 0.1)
+pdf = st.selectbox("Probability density function of annual price returns", ["studentt", "gaussian"])
+average_annual_return = st.slider("Average annual total returns [%]", 0.0, 20.0, 7.0, 0.1)
+std_on_return = st.slider("Standard deviation on price returns [%]", 0.0, 30.0, 16.0, 0.1)
 ter = st.slider("TER [%]", 0.0, 2.0, 0.2, 0.1)
-dividend = st.slider("Dividends [%]", 0.0, 3.0, 1.4, 0.1)
+dividend = st.slider("Rate of annual dividend payout [%]", 0.0, 3.0, 1.4, 0.1)
 
 st.header("Fixed Income Allocation")
 st.write("<small style='color:gray'>Default values for DBX0AN</small>", unsafe_allow_html=True)
 
-average_annual_return_fi = st.slider("Annual returns [%]", 0.0, 5.0, 0.5, 0.1)
-std_on_return_fi = st.slider("Standard deviation on returns [%]", 0.0, 1.0, 0.2, 0.1)
+average_annual_return_fi = st.slider("Average annual total returns [%]", 0.0, 5.0, 0.5, 0.1)
+std_on_return_fi = st.slider("Standard deviation on price returns [%]", 0.0, 1.0, 0.2, 0.1)
 ter_fi = st.slider("TER [%]", 0.0, 1.0, 0.1, 0.05)
 
 st.header("Crash Settings")
 crash = st.checkbox("Enable crash", False)
-crash_prob = st.slider("Crash probability [%]", 1, 10, 3, 1)
+crash_prob = st.slider("Probability of crash (sampled from -20% to -50%) occurring in a given year [%]", 1, 10, 3, 1)
 
 st.markdown(
     """
@@ -57,7 +57,11 @@ st.markdown(
 
 # ---- Run simulation button ----
 if st.button("Simulate"):
-    #st.write("Running simulations...")
+
+    progress = st.progress(0)     
+
+    def update_progress(p):
+        progress.progress(p)
 
     runs, comp_run, capital_run = run_simulations(
         n,
@@ -77,8 +81,11 @@ if st.button("Simulate"):
         std_on_return_fi,
         ter_fi,
         crash,
-        crash_prob
+        crash_prob,
+        progress_callback=update_progress
     )
+
+    progress.progress(1.0)
 
     # Store results in session state
     st.session_state.results = {
@@ -113,3 +120,46 @@ if st.session_state.results is not None:
     )
 
     st.pyplot(fig, use_container_width=True)
+
+    st.subheader("Summary of Input Parameters")
+
+    with st.expander("Show simulation settings", expanded=False):
+
+        colA, colB, colC = st.columns(3)
+
+        with colA:
+            st.markdown(f"""
+            ### Simulation
+            - Simulations: `{n}`
+            - Start year: `{start_year}`
+            - Duration: `{time}` years
+
+            ### Capital & Cashflows
+            - Starting capital: `{starting_capital:,.0f} €`
+            - Yearly cashflow: `{yearly_invest:,.0f} €`
+            - Inflation: `{inflation_value}%`
+            - Tax: `{tax}%`
+            """)
+
+        with colB:
+            st.markdown(f"""
+            ### Stock Allocation
+            - Stock share: `{asset_allocation}%`
+            - PDF: `{pdf}`
+            - Avg. return: `{average_annual_return}%`
+            - Std. dev.: `{std_on_return}%`
+            - TER: `{ter}%`
+            - Dividend: `{dividend}%`
+            """)
+
+        with colC:
+            st.markdown(f"""
+            ### Fixed Income
+            - Avg. return: `{average_annual_return_fi}%`
+            - Std. dev.: `{std_on_return_fi}%`
+            - TER: `{ter_fi}%`
+
+            ### Crash Settings
+            - Crash enabled: `{crash}`
+            - Crash probability: `{crash_prob}%`
+            """)
