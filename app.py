@@ -26,6 +26,8 @@ st.header("Stock Allocation")
 st.write("<small style='color:gray'>Default values for A1JX52</small>", unsafe_allow_html=True)
 
 asset_allocation = st.slider("Share of stocks [%]", 0, 100, 70, 1)
+rebalance = st.checkbox("Rebalance", True)
+rebalance_threshold = st.slider("if allocation is off more than ... [%]", 0, 15, 5, 1)
 pdf = st.selectbox("Probability density function of annual price returns", ["studentt", "gaussian"])
 average_annual_return = st.slider("Average annual total returns [%]", 0.0, 20.0, 7.0, 0.1)
 std_on_return = st.slider("Standard deviation on price returns [%]", 0.0, 30.0, 16.0, 0.1)
@@ -64,24 +66,26 @@ if st.button("Simulate"):
         progress.progress(p)
 
     runs, comp_run, capital_run = run_simulations(
-        n,
-        start_year,
-        time,
-        starting_capital,
-        yearly_invest,
-        inflation_value,
-        tax,
-        asset_allocation,
-        pdf,
-        average_annual_return,
-        std_on_return,
-        ter,
-        dividend,
-        average_annual_return_fi,
-        std_on_return_fi,
-        ter_fi,
-        crash,
-        crash_prob,
+        n=n,
+        start_year=start_year,
+        time=time,
+        starting_capital=starting_capital,
+        yearly_invest=yearly_invest,
+        inflation_value=inflation_value,
+        tax=tax,
+        asset_allocation=asset_allocation,
+        rebalance=rebalance,
+        rebalance_threshold=rebalance_threshold,
+        pdf=pdf,
+        average_annual_return=average_annual_return,
+        std_on_return=std_on_return,
+        ter=ter,
+        dividend=dividend,
+        average_annual_return_fi=average_annual_return_fi,
+        std_on_return_fi=std_on_return_fi,
+        ter_fi=ter_fi,
+        crash=crash,
+        crash_prob=crash_prob,
         progress_callback=update_progress
     )
 
@@ -145,6 +149,8 @@ if st.session_state.results is not None:
             st.markdown(f"""
             ### Stock Allocation
             - Stock share: `{asset_allocation}%`
+            - Rebalance: `{rebalance}` 
+            - Rebalance threshold: `{rebalance_threshold}%`
             - PDF: `{pdf}`
             - Avg. return: `{average_annual_return}%`
             - Std. dev.: `{std_on_return}%`
@@ -155,6 +161,7 @@ if st.session_state.results is not None:
         with colC:
             st.markdown(f"""
             ### Fixed Income
+            - FI share: `{100-asset_allocation}%`
             - Avg. return: `{average_annual_return_fi}%`
             - Std. dev.: `{std_on_return_fi}%`
             - TER: `{ter_fi}%`

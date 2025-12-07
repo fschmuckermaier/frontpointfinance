@@ -5,9 +5,9 @@ from scipy.stats import t, truncnorm
 import random
 
 plt.rcParams.update({
-    'font.family': 'Arial',   # You can use 'Arial', 'Times New Roman', 'Calibri', etc.
+    'font.family': 'Arial',   
     'font.size': 12,
-    'font.weight': 'normal',          # options: 'normal', 'bold', etc.
+    'font.weight': 'normal',          
 })
 
 def annual_return(pdf, price_return, std, prev_log_ret=None, phi=0.1):
@@ -97,125 +97,211 @@ def simulate_inflation_year(current_infl, mu=2.0, phi=0.8, sigma=0.4):
     """
     noise = np.random.normal(0, sigma)
     next_infl = mu + phi * (current_infl - mu) + noise
+
     return max(next_infl, 0)  # inflation cannot be negative here
 
 
-def run_simulation_i(starting_capital, 
-                     time, 
-                     av_return, 
-                     std, 
-                     phi, 
-                     ter, 
-                     dividend, 
-                     yearly_invest,
-                     inflation_value, 
-                     tax, 
-                     pdf="gaussian",
-                     crash=False, 
-                     crash_prob=3):
-    """
-    Simulates one path of portfolio development over 'time' years.
+def run_simulation_portfolio(
+        starting_capital,
+        time,
+        target_stock_allocation,
+        rebalance,
+        rebalance_threshold,
+        av_return_stocks,
+        std_stocks,
+        phi_stocks,
+        ter_stocks,
+        dividend_stocks,
+        av_return_fi,
+        std_fi,
+        phi_fi,
+        ter_fi,
+        yearly_invest,
+        inflation_value,
+        tax,
+        pdf_stocks="studentt",
+        pdf_fi="gaussian",
+        crash=False,
+        crash_prob=3,
+    ):
+        """
+        Simulates portfolio path with stocks and fixed income over 'time' years,
+        with yearly cashflows, taxes, TER, dividends, inflation, crashes,
+        and yearly rebalancing to target allocation.
 
-    Parameters:
-        starting_capital (float): Initial portfolio value.
-        time (int): Number of years to simulate.
-        av_return (float): Expected average annual price return (in %).
-        std (float): Annual return volatility (in %).
-        phi (float): Autocorrelation coefficient for log-returns.
-        ter (float): Total expense ratio (%) deducted annually.
-        dividend (float): Dividend yield (%) before tax.
-        yearly_invest (float): Annual saving (>0) or withdrawal (<0) amount (nominal).
-        inflation_value (float): Starting inflation rate (%).
-        tax (float): Tax rate on dividends and withdrawals (%).
-        pdf (str): Return distribution type: "gaussian" or "studentt".
-        crash (bool): Enable market crash simulation.
-        crash_prob (float): Annual crash probability (%).
+        Parameters:
+            starting_capital (float): Initial total portfolio value.
+            time (int): Number of years to simulate.
+            target_stock_allocation (float): Target % allocation to stocks (0-1).
+            rebalance (bool): Rebalance portfolio yearly to target allocation.
+            av_return_stocks (float): Expected average annual return for stocks (%).
+            std_stocks (float): Volatility of stocks (%).
+            phi_stocks (float): Autocorrelation of stocks returns.
+            ter_stocks (float): Total expense ratio (%) for stocks.
+            dividend_stocks (float): Dividend yield (%) for stocks.
+            av_return_fi (float): Expected average annual return for fixed income (%).
+            std_fi (float): Volatility of fixed income (%).
+            phi_fi (float): Autocorrelation for fixed income returns.
+            ter_fi (float): Total expense ratio (%) for fixed income.
+            yearly_invest (float): Annual net cashflow to portfolio (>0 add, <0 withdraw).
+            inflation_value (float): Starting inflation rate (%).
+            tax (float): Tax rate on dividends and withdrawals (%).
+            pdf_stocks (str): PDF type for stock returns.
+            pdf_fi (str): PDF type for FI returns.
+            crash (bool): Enable crash simulation.
+            crash_prob (float): Annual crash probability (%).
 
-    Returns:
-        cs (list of float): Portfolio value at each year-end (length = time+1).
-    """
-    
-    c=starting_capital
-    portfolio_run=[c] #List for yearly portfolio values
+        Returns:
+            portfolio_values (list): Total portfolio value each year (length time+1).
+        """
 
-    infl_adj_yearly_invest=yearly_invest
+        # Initial split of capital:
+        capital_stocks = starting_capital * target_stock_allocation
+        capital_fi = starting_capital * (1 - target_stock_allocation)
 
-    current_log_ret=None #Set previous years log return to None for autocorrelation
-    inflation_rate=inflation_value #Set beginning of inflation rate walk
-    
-    for i in range(int(time)):
+        portfolio_values = [starting_capital]
 
-        # Determine if crash regime or normal year first:
-        is_crash = (np.random.rand() < 0.01 * crash_prob) and crash
+        # Initial log returns for autocorrelation:
+        current_log_ret_stocks = None
+        current_log_ret_fi = None
 
-        # Cut dividend in crash year:
-        dividend_adj = dividend * (0.5 * is_crash)
-        
-        # Dividends computed with pre-year value:
-        c_div = c * 0.01 * dividend_adj
-        c_div_after_tax = c_div * (1 - 0.01 * tax) # -25% capital tax gain
-        
-        # Calculate price return without dividend yield:
-        price_return = av_return - dividend_adj
-        
-        if is_crash:
-            yr_return = 1 + sample_crash_magnitude()
+        inflation_rate = inflation_value
+        infl_adj_yearly_invest = yearly_invest
 
-        else:
-            yr_return, current_log_ret = annual_return(pdf, price_return, std, current_log_ret, phi)
+
+        for year in range(int(time)):
             
-        # Change due to market gains:
-        c = c * yr_return 
+            # --- Stocks ---
 
-        # Check for insolvency:
-        if c < 0:
-            c = 0
-        
-        # Changes to to investing / withdrawing money:
-        
-        if yearly_invest > 0: #saving money
-            
-            # Re-invest dividends after taxes:
-            c = c + c_div_after_tax 
+            is_crash = (np.random.rand() < 0.01 * crash_prob) and crash
 
-            # New savings:
-            c = c + infl_adj_yearly_invest
-            
-        else: # withdrawing money
-            withdrawal = abs(infl_adj_yearly_invest)
-            
-            if c_div_after_tax >= withdrawal:
-                # Dividends fully cover withdrawal; surplus reinvested
-                surplus = c_div_after_tax - withdrawal
-                c = c + surplus  # Add leftover dividends after withdrawal
-        
+            dividend_adj_stocks = dividend_stocks * (0.5 * is_crash)  # dividend cut if crash
+            c_div_stocks = capital_stocks * 0.01 * dividend_adj_stocks
+            c_div_after_tax_stocks = c_div_stocks * (1 - 0.01 * tax)
+
+            price_return_stocks = av_return_stocks - dividend_adj_stocks
+
+            if is_crash:
+                yr_return_stocks = 1 + sample_crash_magnitude()
             else:
-                # Dividends don't cover withdrawal; withdraw remainder from portfolio    
-                withdrawal_from_portfolio = withdrawal - c_div_after_tax  
-            
-                # Subtract gross withdrawal (accounted for tax loss) from portfolio
-                c = c - withdrawal_from_portfolio / (1 - 0.01 * tax)  
+                yr_return_stocks, current_log_ret_stocks = annual_return(
+                    pdf_stocks, price_return_stocks, std_stocks, current_log_ret_stocks, phi_stocks
+                )
 
-        
-        # Subtract TER:
-        c = c * (1-0.01*ter)
+            capital_stocks = capital_stocks * yr_return_stocks
 
-        # Account for inflation when withdrawing money:
-        if inflation_rate == 0:
-            pass
-        else:
-            inflation_rate = simulate_inflation_year(inflation_rate)
-            
-        infl_adj_yearly_invest*=(1+0.01*inflation_rate)
-        
-        if c == 0 and yearly_invest <= 0:
-            # No capital left and withdrawing money — stop simulation early
-            portfolio_run.extend([0] * (int(time) - i))
-            break
+            # --- Fixed Income ---
 
-        portfolio_run.append(float(c))
+            price_return_fi = av_return_fi
 
-    return portfolio_run
+            # FI assumed no crashes:
+            yr_return_fi, current_log_ret_fi = annual_return(
+                pdf_fi, price_return_fi, std_fi, current_log_ret_fi, phi_fi
+            )
+
+            capital_fi = capital_fi * yr_return_fi
+    
+
+            # --- Rebalance parameters ---
+            if rebalance:
+                rebalance_threshold = 0.01 * rebalance_threshold  # e.g., 5% → 0.05
+            else:
+                rebalance_threshold = 1.0  # 100%, effectively disables rebalancing
+
+            # Calculate current allocation
+            total_capital = capital_stocks + capital_fi
+            current_stock_alloc = capital_stocks / total_capital if total_capital > 0 else target_stock_allocation
+            current_fi_alloc = capital_fi / total_capital if total_capital > 0 else 1 - target_stock_allocation
+
+            # Calculate deviations from target allocation
+            diff_stock = target_stock_allocation - current_stock_alloc
+            diff_fi = (1 - target_stock_allocation) - current_fi_alloc
+
+
+            # --- Apply dividends and yearly cashflows ---
+
+            if yearly_invest > 0: # For saving 
+
+                # Determine underweighted assets
+                understock = diff_stock > rebalance_threshold
+                underfi = diff_fi > rebalance_threshold
+
+                if understock:
+                    # Stocks underweighted: invest all in stocks
+                    invest_stock = infl_adj_yearly_invest
+                    invest_fi = 0
+                elif underfi:
+                    # FI underweighted: invest all in FI
+                    invest_stock = 0
+                    invest_fi = infl_adj_yearly_invest
+                else:
+                    # Neither underweight beyond threshold: invest by target allocation
+                    invest_stock = infl_adj_yearly_invest * target_stock_allocation
+                    invest_fi = infl_adj_yearly_invest * (1 - target_stock_allocation)
+
+                # Add infl_adj yearly invest split by target allocation
+                capital_stocks += invest_stock
+                capital_fi += invest_fi
+
+                # Reinvest dividends after tax:
+                capital_stocks += c_div_after_tax_stocks
+
+            else: # Withdrawals:
+
+                withdrawal = abs(infl_adj_yearly_invest)
+
+                # Determine overweighted assets
+                overweight_stock = diff_stock < -rebalance_threshold
+                overweight_fi = diff_fi < -rebalance_threshold
+
+                if overweight_stock:
+                    # Stocks overweighted: withdraw all from stocks
+                    withdraw_stock = withdrawal
+                    withdraw_fi = 0
+
+                elif overweight_fi:
+                    # FI overweighted: withdraw all from FI
+                    withdraw_stock = 0
+                    withdraw_fi = withdrawal
+
+                else:
+                    # Neither overweight beyond threshold: withdraw by target allocation
+                    withdraw_stock = withdrawal * target_stock_allocation
+                    withdraw_fi = withdrawal * (1 - target_stock_allocation)
+
+                # Stocks:
+                if c_div_after_tax_stocks >= withdraw_stock:
+                    surplus = c_div_after_tax_stocks - withdraw_stock
+                    capital_stocks += surplus
+                else:
+                    remaining_withdrawal_from_stocks = withdraw_stock - c_div_after_tax_stocks
+                    capital_stocks -= remaining_withdrawal_from_stocks / (1 - 0.01 * tax)
+
+                # FI (no dividends):
+                capital_fi -= withdraw_fi / (1 - 0.01 * tax)
+
+
+            # --- Subtract TER ---
+            capital_stocks *= (1 - 0.01 * ter_stocks)
+            capital_fi *= (1 - 0.01 * ter_fi)
+
+            # --- Adjust inflation ---
+            if inflation_rate == 0:
+                pass
+            else:
+                inflation_rate = simulate_inflation_year(inflation_rate)
+            infl_adj_yearly_invest *= (1 + 0.01 * inflation_rate)
+
+            # --- Append ---
+            total_portfolio = capital_stocks + capital_fi
+            portfolio_values.append(float(total_portfolio))
+
+            # If portfolio depleted and withdrawing, stop early
+            if total_portfolio == 0 and yearly_invest <= 0:
+                portfolio_values.extend([0] * (int(time) - year))
+                break
+
+        return portfolio_values
 
 
 def run_simulations(n=1000,
@@ -226,6 +312,8 @@ def run_simulations(n=1000,
                     inflation_value=0,
                     tax=25,
                     asset_allocation=70,
+                    rebalance=True,
+                    rebalance_threshold=5,
                     pdf="studentt",
                     average_annual_return=5,
                     std_on_return=13,
@@ -248,6 +336,7 @@ def run_simulations(n=1000,
         inflation_value (float): Initial inflation rate (%).
         tax (float): Tax rate (%) on dividends and withdrawals.
         asset_allocation (float): % of portfolio in stocks.
+        rebalance (bool): Rebalance portfolio yearly to target allocation.
         pdf (str): Distribution type for returns ("studentt" or "gaussian").
         average_annual_return (float): Expected stock price return (%).
         std_on_return (float): Stock return volatility (%).
@@ -266,53 +355,97 @@ def run_simulations(n=1000,
         runs (np.array): Simulated portfolio values (n x (time+1)).
         comp_run (np.array): Deterministic composite portfolio run (time+1).
         capital_run (np.array): Baseline run with zero returns, only cash flows.
-    """
-    # Convert percentage:
-    share_stocks=asset_allocation*0.01
-    share_fi=(1-share_stocks)
-    
-    # Run path with zero volatility for stocks:
-
+    """    
     #Adjust annual exp. returns if crash is enabled (Using hard-coded expected crash magnitude of -35%):
     adjusted_average_annual_return = average_annual_return + (0.01 * crash_prob * (-35)) if crash else average_annual_return
     
-    comp_run_stocks=np.array(
-        run_simulation_i(share_stocks*starting_capital,time,adjusted_average_annual_return,0, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax,pdf=pdf)
-    )
+    # Convert percentage:
+    target_stock_allocation=asset_allocation*0.01
 
-    # Run path with zero volatility for FI:
-    comp_run_fi=np.array(
-        run_simulation_i(share_fi*starting_capital,time,average_annual_return_fi, 0, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value,tax, pdf="gaussian")
+    # Run path with zero volatility for stocks:
+    comp_run = run_simulation_portfolio(
+        starting_capital=starting_capital,
+        time=time,
+        target_stock_allocation=target_stock_allocation,
+        rebalance=True,
+        rebalance_threshold=rebalance_threshold,
+        av_return_stocks=adjusted_average_annual_return,
+        std_stocks=0,
+        phi_stocks=0.1,
+        ter_stocks=ter,
+        dividend_stocks=dividend,
+        av_return_fi=average_annual_return_fi,
+        std_fi=0,
+        phi_fi=0.02,
+        ter_fi=ter_fi,
+        yearly_invest=yearly_invest,
+        inflation_value=inflation_value,
+        tax=tax,
+        pdf_stocks=pdf,
+        pdf_fi="gaussian",
+        crash=False,
+        crash_prob=0,
     )
-    
-    # Combine both assets:
-    comp_run = comp_run_stocks + comp_run_fi
 
     # Compute change of capital without any returns or volatility. Just savings / withdrawals:
-    capital_run = run_simulation_i(starting_capital,time,0,0,0,0,0,yearly_invest,inflation_value, tax, pdf="gaussian")
+    capital_run = run_simulation_portfolio(
+        starting_capital=starting_capital,
+        time=time,
+        target_stock_allocation=target_stock_allocation,
+        rebalance=False,
+        rebalance_threshold=rebalance_threshold,
+        av_return_stocks=0,
+        std_stocks=0,
+        phi_stocks=0,
+        ter_stocks=0,
+        dividend_stocks=0,
+        av_return_fi=0,
+        std_fi=0,
+        phi_fi=0,
+        ter_fi=0,
+        yearly_invest=yearly_invest,
+        inflation_value=inflation_value,
+        tax=tax,
+        pdf_stocks="gaussian",
+        pdf_fi="gaussian",
+        crash=False,
+        crash_prob=0,
+    )
 
     # Compute portfolio development:
     runs = []
     for i in range(n):
         
-        # Simulate stocks for this path
-        sim_stocks= np.array(
-            run_simulation_i(share_stocks*starting_capital,time, average_annual_return,std_on_return, 0.1, ter, dividend, share_stocks*yearly_invest,inflation_value,tax, pdf,crash, crash_prob)
+        # Run one portfolio simulation path
+        sim = run_simulation_portfolio(
+            starting_capital=starting_capital,
+            time=time,
+            target_stock_allocation=target_stock_allocation,
+            rebalance=True,
+            rebalance_threshold=rebalance_threshold,
+            av_return_stocks=average_annual_return,
+            std_stocks=std_on_return,
+            phi_stocks=0.1,
+            ter_stocks=ter,
+            dividend_stocks=dividend,
+            av_return_fi=average_annual_return_fi,
+            std_fi=std_on_return_fi,
+            phi_fi=0.02,
+            ter_fi=ter_fi,
+            yearly_invest=yearly_invest,
+            inflation_value=inflation_value,
+            tax=tax,
+            pdf_stocks=pdf,
+            pdf_fi="gaussian",
+            crash=crash,
+            crash_prob=crash_prob,
         )
 
-        # Simulate fixed income for this path
-        sim_fi = np.array(
-            run_simulation_i(share_fi*starting_capital,time, average_annual_return_fi,std_on_return_fi, 0.02, ter_fi, 0, share_fi*yearly_invest,inflation_value, tax, "gaussian",False, crash_prob)
-        )
-
-        # combine
-        runs.append(sim_stocks + sim_fi)
+        runs.append(sim)
 
         # Update progress bar callback if provided
         if progress_callback is not None:
             progress_callback((i + 1) / n)
-
-    #runs = np.array(runs)
 
     return runs, comp_run, capital_run
 
