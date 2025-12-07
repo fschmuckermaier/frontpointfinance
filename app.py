@@ -27,7 +27,7 @@ st.write("<small style='color:gray'>Default values for A1JX52</small>", unsafe_a
 
 asset_allocation = st.slider("Share of stocks [%]", 0, 100, 70, 1)
 rebalance = st.checkbox("Rebalance", True)
-rebalance_threshold = st.slider("if allocation is off more than ... [%]", 0, 15, 5, 1)
+rebalance_threshold = st.slider("via savings / withdrawals if allocation is off more than ... [%]", 0, 15, 5, 1)
 pdf = st.selectbox("Probability density function of annual price returns", ["studentt", "gaussian"])
 average_annual_return = st.slider("Average annual total returns [%]", 0.0, 20.0, 7.0, 0.1)
 std_on_return = st.slider("Standard deviation on price returns [%]", 0.0, 30.0, 16.0, 0.1)
