@@ -102,7 +102,7 @@ if st.button("Simulate"):
     }
 
 if st.session_state.results is not None:
-    col1, col2, col3 = st.columns([0.8, 11.5, 5])  # center col2
+    col1, col2, col3 = st.columns([0.75, 11.5, 5])  # center col2
 
     with col2:
         year = st.slider(
@@ -123,7 +123,7 @@ if st.session_state.results is not None:
         st.session_state.results["starting_capital"]
     )
 
-    st.pyplot(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Summary of Input Parameters")
 
