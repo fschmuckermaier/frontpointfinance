@@ -83,26 +83,6 @@ def sample_crash_magnitude(mean=-0.35, std=0.10, lower=-0.50, upper=-0.20):
     
     return crash_return
     
-
-def simulate_inflation_year(current_infl, mu=2.0, phi=0.8, sigma=0.4):
-    """
-    Simulate next year's inflation rate as an AR(1) process.
-    
-    Args:
-        current_infl (float): inflation rate in percent at previous year
-        mu (float): long-term mean inflation (percent)
-        phi (float): persistence coefficient (0 < phi < 1)
-        sigma (float): std dev of inflation shocks (percent)
-    
-    Returns:
-        float: next year's inflation rate (percent)
-    """
-    noise = np.random.normal(0, sigma)
-    next_infl = mu + phi * (current_infl - mu) + noise
-
-    return max(next_infl, 0)  # inflation cannot be negative here
-
-
 def run_simulation_portfolio(
         starting_capital,
         time,
@@ -290,10 +270,6 @@ def run_simulation_portfolio(
             capital_fi *= (1 - 0.01 * ter_fi)
 
             # --- Adjust inflation ---
-            if inflation_rate == 0:
-                pass
-            else:
-                inflation_rate = simulate_inflation_year(inflation_rate)
             infl_adj_yearly_invest *= (1 + 0.01 * inflation_rate)
 
             # --- Append ---
@@ -455,12 +431,13 @@ def run_simulations(n=1000,
 
 
 def plot_simulations(year,
-                     runs,
-                     comp_run, 
-                     capital_run, 
-                     start_year,
-                     time, 
-                     starting_capital):
+                    runs,
+                    comp_run, 
+                    capital_run, 
+                    start_year,
+                    time, 
+                    starting_capital,
+                    inflation_value):
     """
     Plot simulation results of portfolio value paths and distribution.
 
@@ -478,6 +455,8 @@ def plot_simulations(year,
         Total number of years simulated.
     starting_capital : float
         Initial portfolio value.
+    inflation_value : float
+        Initial inflation rate (%).
 
     Returns:
     --------
@@ -658,23 +637,50 @@ def plot_simulations(year,
     cap_val = capital_run[idx_year]
     comp_val = comp_run[idx_year]
 
+    # --- Statistics - inflation adjusted ---
+    inflation_factor = (1 + 0.01 * inflation_value)**(idx_year)
+    median_infl = median / inflation_factor
+    p10_infl = p10 / inflation_factor
+    p25_infl = p25 / inflation_factor
+    p75_infl = p75 / inflation_factor
+    p90_infl = p90 / inflation_factor
+    cap_val_infl = cap_val / inflation_factor
+    comp_val_infl = comp_val / inflation_factor
+
     def round_k(x):
         return int(np.ceil(x / 1000) * 1000)
 
     median, p10, p25, p75, p90 = map(round_k, [median, p10, p25, p75, p90])
+    median_infl, p10_infl, p25_infl, p75_infl, p90_infl = map(round_k, [median_infl, p10_infl, p25_infl, p75_infl, p90_infl])
     cap_val, comp_val = map(round_k, [cap_val, comp_val])
+    cap_val_infl, comp_val_infl = map(round_k, [cap_val_infl, comp_val_infl])
 
-    lines = {
-        "Median": (median, "navy"),
-        "10th perc.": (p10, "rgba(30, 60, 180, 0.5)"),
-        "25th perc.": (p25, "rgba(30, 60, 180, 0.7)"),    # Slightly stronger fill color
-        "75th perc.": (p75, "rgba(30, 60, 180, 0.7)"),
-        "90th perc.": (p90, "rgba(30, 60, 180, 0.5)"),
-        "Capital only": (cap_val, "mediumseagreen"),
-    }
+    # --- Robust y-axis limits (global across all years) ---
+    all_values = np.concatenate(runs)
+    y_high = np.percentile(all_values, 99)
 
-    for label, (val, color) in lines.items():
+    # --- Staggered annotations ---
+    entries = [
+        (median,  median_infl,  "navy",                   "Median"),
+        (p10,     p10_infl,     "rgba(30, 60, 180, 0.5)", "10th perc."),
+        (p25,     p25_infl,     "rgba(30, 60, 180, 0.7)", "25th perc."),
+        (p75,     p75_infl,     "rgba(30, 60, 180, 0.7)", "75th perc."),
+        (p90,     p90_infl,     "rgba(30, 60, 180, 0.5)", "90th perc."),
+        (cap_val, cap_val_infl, "mediumseagreen",          "Capital only"),
+    ]
 
+    MIN_GAP = y_high * 0.04  # minimum vertical spacing between labels (4% of y range)
+
+    # Sort by value so nudging is predictable (bottom to top)
+    entries_sorted = sorted(entries, key=lambda e: e[0])
+
+    # Compute nudged label y-positions
+    label_ys = [e[0] for e in entries_sorted]
+    for i in range(1, len(label_ys)):
+        if label_ys[i] - label_ys[i - 1] < MIN_GAP:
+            label_ys[i] = label_ys[i - 1] + MIN_GAP
+
+    for (val, val_infl, color, label), label_y in zip(entries_sorted, label_ys):
         fig.add_hline(
             y=val,
             line_color=color,
@@ -682,17 +688,333 @@ def plot_simulations(year,
             col=2
         )
 
-        
         fig.add_annotation(
-            x=0.93,
+            x=0.88,
+            y=label_y,
+            xref="paper",
+            yref="y2",
+            text=f"{label}: {int(val/1000)}k€ ({int(val_infl/1000)}k€ real)",
+            showarrow=False,
+            font=dict(color=color, size=12),
+            align="left",
+            xanchor="left",
+        )
+
+    # Bankruptcy box
+    fig.add_annotation(
+        x=0.9,
+        y=0.98,
+        xref="paper",
+        yref="paper",
+        text=f"<b>Probability of bankruptcy</b><br>{prob_bankr:.1f}%",
+        showarrow=False,
+        align="right",
+        bordercolor="firebrick",
+        borderwidth=1,
+        bgcolor="white",
+        font=dict(color="firebrick")
+    )
+
+    # --- Layout ---
+    fig.update_layout(
+        height=500,
+        margin=dict(l=40, r=50, t=20, b=40),
+        hovermode="x unified",
+        xaxis2=dict(domain=[0.78, 0.88]),  
+        xaxis=dict(
+            domain=[0, 0.72],
+            title_font=dict(size=18),
+            tickfont=dict(size=16)
+        ),
+        yaxis=dict(
+            title_font=dict(size=18),
+            tickfont=dict(size=16)
+        ),
+    )
+
+    fig.update_yaxes(
+        tickformat=".0f",
+        col=1
+    )
+
+    fig.update_xaxes(
+        range=[start_year, start_year + time],
+        col=1
+    )
+
+    # Share y-axis between panels
+    fig.update_yaxes(matches="y", col=2)
+
+    fig.update_xaxes(showticklabels=False, col=2)
+    fig.update_yaxes(showticklabels=False, col=2)
+
+    fig.update_yaxes(
+        range=[0, y_high],
+        col=1
+    )
+
+    fig.update_yaxes(
+        range=[0, y_high],
+        col=2
+    )
+
+    return fig
+
+
+
+"""
+def plot_simulations(year,
+                     runs,
+                     comp_run, 
+                     capital_run, 
+                     start_year,
+                     time, 
+                     starting_capital,
+                     inflation_value):
+    
+    
+    Plot simulation results of portfolio value paths and distribution.
+
+    Parameters:
+    -----------
+    year : int or float
+        The year to highlight and show distribution for (e.g., 2030).
+    runs : array-like, shape (n_simulations, time+1)
+        Ensemble of simulation paths for the portfolio values.
+    comp_run : array-like, shape (time+1,)
+        Deterministic portfolio path without volatility.
+    capital_run : array-like, shape (time+1,)
+        Portfolio value based on capital contributions only (no returns).
+    time : int
+        Total number of years simulated.
+    starting_capital : float
+        Initial portfolio value.
+    inflation_value : float
+        Initial inflation rate (%).
+
+    Returns:
+    --------
+    None
+    Displays two plots:
+    - Left: multiple simulation paths and key deterministic paths.
+    - Right: histogram of portfolio values at the selected year with statistics.
+
+    years = np.linspace(start_year, start_year + time, int(time) + 1)
+    idx_year = int(year - start_year)
+    values_at_year = np.array([run[idx_year] for run in runs])
+
+    fig = make_subplots(
+        cols=2,
+        column_widths=[0.8, 0.2],
+        horizontal_spacing=0.05
+    )
+
+    # --- Percentile paths ---
+    runs_array = np.array(runs)
+
+    p10_path = np.percentile(runs_array, 10, axis=0)
+    p25_path = np.percentile(runs_array, 25, axis=0)
+    p50_path = np.percentile(runs_array, 50, axis=0)
+    p75_path = np.percentile(runs_array, 75, axis=0)
+    p90_path = np.percentile(runs_array, 90, axis=0)
+
+    # --- LEFT PANEL ---
+
+    # --- 10–90% percentile band ---
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=p90_path,
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip"
+        ),
+        col=1, row=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=p10_path,
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(30, 60, 180, 0.25)",
+            name="10–90% interval",
+            hoverinfo="skip"
+        ),
+        col=1, row=1
+    )
+
+    # Add 75th percentile line (invisible line for fill)
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=p75_path,
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip"
+        ),
+        col=1, row=1
+    )
+
+    # Fill between 25th and 75th percentile
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=p25_path,
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(30, 60, 180, 0.5)",  # Slightly stronger than 10-90%
+            name="25–75% interval",
+            hoverinfo="skip"
+        ),
+        col=1, row=1
+    )
+
+    # --- Median path ---
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=p50_path,
+            mode="lines",
+            line=dict(color="navy", width=2),
+            name="Median outcome"
+        ),
+        col=1, row=1
+    )
+
+    # Capital only path
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=capital_run,
+            mode="lines",
+            line=dict(color="mediumseagreen", shape="hv"),
+            name="Capital only (no returns)"
+        ),
+        col=1, row=1
+    )
+
+    # Highlight 10 random paths
+    for i in [2, 3, 4, 5, 6,7,8,9,10,11]:
+        fig.add_trace(
+            go.Scatter(
+                x=years,
+                y=runs[i],
+                mode="lines",
+                line=dict(color="black", width=1),
+                opacity=0.5,
+                visible='legendonly',  # hidden initially
+                showlegend=(i == 2),   # only first trace shows legend entry
+                name="10 random paths (click to show)",
+                legendgroup="random_paths"  # group them
+            ),
+            col=1, row=1
+        )
+    
+    fig.add_vline(x=year, line_width=1, line_color="red", col=1)
+
+    fig.update_layout(
+        legend=dict(
+            x=0.02,        # near left edge of the left subplot
+            y=0.95,        # near top
+            bgcolor="rgba(255,255,255,0.8)",  # semi-transparent white bg for readability
+            bordercolor="gray",
+            borderwidth=1,
+            font=dict(size=14),
+            orientation="v"  # vertical legend
+        )
+    )
+
+    # --- RIGHT PANEL: histogram ---
+    cap = np.percentile(values_at_year, 99.5)
+    values_capped = np.clip(values_at_year, 0, cap)
+
+    # Density histogram
+    density, bin_edges = np.histogram(
+        values_capped,
+        bins=50,
+        density=True
+    )
+
+    y_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    fig.add_trace(
+        go.Scatter(
+            x=density,
+            y=y_centers,
+            mode="lines",
+            fill="tozerox",
+            fillcolor="rgba(128, 128, 128, 0.3)",  # light gray with 30% opacity
+            line=dict(color="rgba(128, 128, 128, 0)"),  # fully transparent line (no outline)
+            opacity=0.5,
+            showlegend=True,
+            name="Distribution of possible outcomes",
+            legendgroup="distribution",
+            hovertemplate="Value: %{y:,.0f} €<br>Density: %{x:.4f}<extra></extra>"
+        ),
+        col=2, row=1
+    )
+
+    # --- Statistics ---
+    prob_bankr = 100 * np.mean(values_at_year <= 0)
+    median = np.median(values_at_year)
+    p10 = np.percentile(values_at_year, 10)
+    p25 = np.percentile(values_at_year, 25)
+    p75 = np.percentile(values_at_year, 75)
+    p90 = np.percentile(values_at_year, 90)
+    cap_val = capital_run[idx_year]
+    comp_val = comp_run[idx_year]
+
+    # --- Statistics - inlfation adjusted ---
+    inflation_factor = (1 + 0.01 * inflation_value)**(idx_year)
+    median_infl = median / inflation_factor
+    p10_infl = p10 / inflation_factor
+    p25_infl = p25 / inflation_factor
+    p75_infl = p75 / inflation_factor
+    p90_infl = p90 / inflation_factor
+    cap_val_infl = cap_val / inflation_factor
+    comp_val_infl = comp_val / inflation_factor
+
+    def round_k(x):
+        return int(np.ceil(x / 1000) * 1000)
+
+    median, p10, p25, p75, p90 = map(round_k, [median, p10, p25, p75, p90])
+    median_infl, p10_infl, p25_infl, p75_infl, p90_infl = map(round_k, [median_infl, p10_infl, p25_infl, p75_infl, p90_infl])
+    cap_val, comp_val = map(round_k, [cap_val, comp_val])
+    cap_val_infl, comp_val_infl = map(round_k, [cap_val_infl, comp_val_infl])
+
+    lines = {
+        "Median":       (median,  median_infl,  "navy"),
+        "10th perc.":   (p10,     p10_infl,     "rgba(30, 60, 180, 0.5)"),
+        "25th perc.":   (p25,     p25_infl,     "rgba(30, 60, 180, 0.7)"),
+        "75th perc.":   (p75,     p75_infl,     "rgba(30, 60, 180, 0.7)"),
+        "90th perc.":   (p90,     p90_infl,     "rgba(30, 60, 180, 0.5)"),
+        "Capital only": (cap_val, cap_val_infl, "mediumseagreen"),
+    }
+
+    for label, (val, val_infl, color) in lines.items():
+        fig.add_hline(
+            y=val,
+            line_color=color,
+            opacity=0.8,
+            col=2
+        )
+
+        fig.add_annotation(
+            x=0.88,
             y=val,
             xref="paper",
             yref="y2",
-            text=f"{label} ({int(val/1000)} k€)",
+            text=f"{label}: {int(val/1000)}k€ ({int(val_infl/1000)}k€ real)",            
             showarrow=False,
-            font=dict(color=color, size=13),
+            font=dict(color=color, size=12),
             align="left",
-            xanchor="left",   
+            xanchor="left",
         )
             
 
@@ -716,7 +1038,7 @@ def plot_simulations(year,
         height=500,
         margin=dict(l=40, r=50, t=20, b=40),
         hovermode="x unified",
-        xaxis2=dict(domain=[0.75, 0.93]),  
+        xaxis2=dict(domain=[0.78, 0.88]),  
         xaxis=dict(
             domain=[0, 0.72],
             title_font=dict(size=18),  # bigger font size for x-axis label
@@ -761,3 +1083,4 @@ def plot_simulations(year,
     )
 
     return fig
+"""

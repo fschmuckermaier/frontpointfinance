@@ -12,13 +12,13 @@ st.title("📈 FrontPointFinance Monte Carlo")
 st.header("Simulation Parameters")
 
 n = st.slider("Number of simulations", 0, 10000, 1000, 100)
-start_year = st.slider("Starting year of simulation", 2025, 2100, 2025, 1)
+start_year = st.slider("Starting year of simulation", 2026, 2100, 2026, 1)
 time = st.slider("Run time of simulation [yrs]", 0, 50, 20, 1)
 
 st.header("Capital & Cashflows")
 
 starting_capital = st.slider("Starting portfolio value [€]", 0, 2_000_000, 10_000, 1000)
-yearly_invest = st.slider("Annual amount saved (+) or withdrawn (-) from the portfolio [€]", -50_000, 50_000, 0, 100)
+yearly_invest = st.slider("Annual amount saved (+) or withdrawn (-) from the portfolio [€]", -100_000, 100_000, 0, 100)
 inflation_value = st.slider("Inflation-rate to modify yearly cashflow [%]", 0.0, 10.0, 0.0, 0.1)
 tax = st.slider("Capital gain tax [%]", 0, 40, 25, 1)
 
@@ -120,7 +120,8 @@ if st.session_state.results is not None:
         st.session_state.results["capital_run"],
         st.session_state.results["start_year"],
         st.session_state.results["time"],
-        st.session_state.results["starting_capital"]
+        st.session_state.results["starting_capital"],
+        inflation_value,
     )
 
     st.plotly_chart(fig, use_container_width=True)
