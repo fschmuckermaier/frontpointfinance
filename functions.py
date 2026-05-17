@@ -12,7 +12,7 @@ plt.rcParams.update({
     'font.weight': 'normal',          
 })
 
-def annual_return(pdf, price_return, std, prev_log_ret=None, phi=0.1):
+def annual_return(pdf, price_return, std):
     """
     Simulates the annual return of a portfolio given the return distribution type.
     
@@ -22,41 +22,28 @@ def annual_return(pdf, price_return, std, prev_log_ret=None, phi=0.1):
                    - "studentt": Student's t-distribution on log-returns with autocorrelation.
         price_return (float): Expected annual price return in percentage (e.g., 5 for 5%).
         std (float): Standard deviation of the returns in percentage.
-        prev_log_ret (float, optional): Previous year's log-return (used only if pdf="studentt").
-                                       If None, the process starts at the mean log-return.
-        phi (float, optional): Autocorrelation coefficient for AR(1) process on log-returns
-                               (used only if pdf="studentt"). Default is 0.1.
-    
+        
     Returns:
         yr_return (float): Simulated annual return as a multiplier (e.g., 1.05 for +5%).
-        current_log_ret (float or None): Current year's log-return (used for autocorrelation).
-                                        Returns None if pdf="gaussian".
     """
+
     if pdf=="gaussian":
         yr_mult=np.random.normal(price_return, std, 1)[0]
         yr_return=1+0.01*yr_mult
         current_log_ret=None
         
-    if pdf=="studentt":
+    if pdf == "studentt":
         nu = 5
         mu_log = np.log(1 + price_return * 0.01) - 0.5 * (std * 0.01) ** 2
         scale_log = std * 0.01 * np.sqrt((nu - 2) / nu)  # variance correction
-        
+
         # Draw innovation noise epsilon_t ~ Student-t with mean 0
-        t_dist = t(df=nu, loc=0, scale=scale_log)
-        epsilon = t_dist.rvs()
-        
-        # Initialize previous year's log-return if first call
-        if prev_log_ret is None:
-            # Start at mean log-return if no prior info
-            prev_log_ret = mu_log
-        
-        # AR(1) update: X_t = mu_log + phi*(prev_log_ret - mu_log) + epsilon
-        current_log_ret = mu_log + phi * (prev_log_ret - mu_log) + epsilon
-        
+        t_dist = t(df=nu, loc=mu_log, scale=scale_log)
+        current_log_ret = t_dist.rvs()
+
         yr_return = np.exp(current_log_ret)
 
-    return yr_return, current_log_ret
+    return yr_return
     
 
 def sample_crash_magnitude(mean=-0.35, std=0.10, lower=-0.50, upper=-0.20):
@@ -91,12 +78,10 @@ def run_simulation_portfolio(
         rebalance_threshold,
         av_return_stocks,
         std_stocks,
-        phi_stocks,
         ter_stocks,
         dividend_stocks,
         av_return_fi,
         std_fi,
-        phi_fi,
         ter_fi,
         yearly_invest,
         inflation_value,
@@ -118,18 +103,15 @@ def run_simulation_portfolio(
             rebalance (bool): Rebalance portfolio yearly to target allocation.
             av_return_stocks (float): Expected average annual return for stocks (%).
             std_stocks (float): Volatility of stocks (%).
-            phi_stocks (float): Autocorrelation of stocks returns.
             ter_stocks (float): Total expense ratio (%) for stocks.
             dividend_stocks (float): Dividend yield (%) for stocks.
             av_return_fi (float): Expected average annual return for fixed income (%).
             std_fi (float): Volatility of fixed income (%).
-            phi_fi (float): Autocorrelation for fixed income returns.
             ter_fi (float): Total expense ratio (%) for fixed income.
             yearly_invest (float): Annual net cashflow to portfolio (>0 add, <0 withdraw).
             inflation_value (float): Starting inflation rate (%).
             tax (float): Tax rate on dividends and withdrawals (%).
             pdf_stocks (str): PDF type for stock returns.
-            pdf_fi (str): PDF type for FI returns.
             crash (bool): Enable crash simulation.
             crash_prob (float): Annual crash probability (%).
 
@@ -142,10 +124,6 @@ def run_simulation_portfolio(
         capital_fi = starting_capital * (1 - target_stock_allocation)
 
         portfolio_values = [starting_capital]
-
-        # Initial log returns for autocorrelation:
-        current_log_ret_stocks = None
-        current_log_ret_fi = None
 
         inflation_rate = inflation_value
         infl_adj_yearly_invest = yearly_invest
@@ -166,8 +144,8 @@ def run_simulation_portfolio(
             if is_crash:
                 yr_return_stocks = 1 + sample_crash_magnitude()
             else:
-                yr_return_stocks, current_log_ret_stocks = annual_return(
-                    pdf_stocks, price_return_stocks, std_stocks, current_log_ret_stocks, phi_stocks
+                yr_return_stocks = annual_return(
+                    pdf_stocks, price_return_stocks, std_stocks
                 )
 
             capital_stocks = capital_stocks * yr_return_stocks
@@ -179,8 +157,8 @@ def run_simulation_portfolio(
             if is_crash:
                 yr_return_fi = 0.98 # -2% during crash to model correlation with stocks
             else:
-                yr_return_fi, current_log_ret_fi = annual_return(
-                    pdf_fi, price_return_fi, std_fi, current_log_ret_fi, phi_fi
+                yr_return_fi = annual_return(
+                    pdf_fi, price_return_fi, std_fi
                 )
 
             capital_fi = capital_fi * yr_return_fi
@@ -320,12 +298,10 @@ def run_simulations(n=1000,
         pdf (str): Distribution type for returns ("studentt" or "gaussian").
         average_annual_return (float): Expected stock price return (%).
         std_on_return (float): Stock return volatility (%).
-        phi_stocks (float): Autocorrelation for stock returns.
         ter (float): Stock total expense ratio (%).
         dividend (float): Stock dividend yield (%).
         average_annual_return_fi (float): FI expected return (%).
         std_on_return_fi (float): FI return volatility (%).
-        phi_fi (float): Autocorrelation for FI returns.
         ter_fi (float): FI total expense ratio (%).
         crash (bool): Enable crash simulation.
         crash_prob (float): Annual crash probability (%).
@@ -351,12 +327,10 @@ def run_simulations(n=1000,
         rebalance_threshold=rebalance_threshold,
         av_return_stocks=adjusted_average_annual_return,
         std_stocks=0,
-        phi_stocks=0.1,
         ter_stocks=ter,
         dividend_stocks=dividend,
         av_return_fi=average_annual_return_fi,
         std_fi=0,
-        phi_fi=0.02,
         ter_fi=ter_fi,
         yearly_invest=yearly_invest,
         inflation_value=inflation_value,
@@ -376,12 +350,10 @@ def run_simulations(n=1000,
         rebalance_threshold=rebalance_threshold,
         av_return_stocks=0,
         std_stocks=0,
-        phi_stocks=0,
         ter_stocks=0,
         dividend_stocks=0,
         av_return_fi=0,
         std_fi=0,
-        phi_fi=0,
         ter_fi=0,
         yearly_invest=yearly_invest,
         inflation_value=inflation_value,
@@ -405,12 +377,10 @@ def run_simulations(n=1000,
             rebalance_threshold=rebalance_threshold,
             av_return_stocks=average_annual_return,
             std_stocks=std_on_return,
-            phi_stocks=0.1,
             ter_stocks=ter,
             dividend_stocks=dividend,
             av_return_fi=average_annual_return_fi,
             std_fi=std_on_return_fi,
-            phi_fi=0.02,
             ter_fi=ter_fi,
             yearly_invest=yearly_invest,
             inflation_value=inflation_value,
