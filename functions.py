@@ -128,6 +128,8 @@ def run_simulation_portfolio(
         inflation_rate = inflation_value
         infl_adj_yearly_invest = yearly_invest
 
+        
+        effective_threshold = 0.01 * rebalance_threshold if rebalance else 1.0
 
         for year in range(int(time)):
             
@@ -135,7 +137,7 @@ def run_simulation_portfolio(
 
             is_crash = (np.random.rand() < 0.01 * crash_prob) and crash
 
-            dividend_adj_stocks = dividend_stocks * (0.5 * is_crash)  # dividend cut if crash
+            dividend_adj_stocks = dividend_stocks * (0.5 if is_crash else 1.0)
             c_div_stocks = capital_stocks * 0.01 * dividend_adj_stocks
             c_div_after_tax_stocks = c_div_stocks * (1 - 0.01 * tax)
 
@@ -162,13 +164,6 @@ def run_simulation_portfolio(
                 )
 
             capital_fi = capital_fi * yr_return_fi
-    
-
-            # --- Rebalance parameters ---
-            if rebalance:
-                rebalance_threshold = 0.01 * rebalance_threshold  
-            else:
-                rebalance_threshold = 1.0  # 100%, effectively disables rebalancing
 
             # Calculate current allocation
             total_capital = capital_stocks + capital_fi
@@ -182,11 +177,11 @@ def run_simulation_portfolio(
 
             # --- Apply dividends and yearly cashflows ---
 
-            if yearly_invest > 0: # For saving 
+            if yearly_invest >= 0: # For saving 
 
                 # Determine underweighted assets
-                understock = diff_stock > rebalance_threshold
-                underfi = diff_fi > rebalance_threshold
+                understock = diff_stock > effective_threshold
+                underfi = diff_fi > effective_threshold
 
                 if understock:
                     # Stocks underweighted: invest all in stocks
@@ -213,8 +208,8 @@ def run_simulation_portfolio(
                 withdrawal = abs(infl_adj_yearly_invest)
 
                 # Determine overweighted assets
-                overweight_stock = diff_stock < -rebalance_threshold
-                overweight_fi = diff_fi < -rebalance_threshold
+                overweight_stock = diff_stock < -effective_threshold
+                overweight_fi = diff_fi < -effective_threshold
 
                 if overweight_stock:
                     # Stocks overweighted: withdraw all from stocks
@@ -312,9 +307,7 @@ def run_simulations(n=1000,
         comp_run (np.array): Deterministic composite portfolio run (time+1).
         capital_run (np.array): Baseline run with zero returns, only cash flows.
     """    
-    #Adjust annual exp. returns if crash is enabled (Using hard-coded expected crash magnitude of -35%):
-    adjusted_average_annual_return = average_annual_return + (0.01 * crash_prob * (-35)) if crash else average_annual_return
-    
+
     # Convert percentage:
     target_stock_allocation=asset_allocation*0.01
 
@@ -325,7 +318,7 @@ def run_simulations(n=1000,
         target_stock_allocation=target_stock_allocation,
         rebalance=True,
         rebalance_threshold=rebalance_threshold,
-        av_return_stocks=adjusted_average_annual_return,
+        av_return_stocks=average_annual_return,
         std_stocks=0,
         ter_stocks=ter,
         dividend_stocks=dividend,
