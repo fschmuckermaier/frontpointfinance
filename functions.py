@@ -6,6 +6,81 @@ import random
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+GERMAN_TAX_FREE_ALLOWANCE = 1000  # Sparer-Pauschbetrag per year, single filer (since 2023)
+
+
+def _grow_lots(lots, factor):
+    for lot in lots:
+        lot["value"] *= factor
+
+
+def _apply_ter_lots(lots, ter):
+    factor = 1 - 0.01 * ter
+    for lot in lots:
+        lot["value"] *= factor
+
+
+def _add_lot(lots, amount):
+    if amount > 0:
+        lots.append({"cost": amount, "value": amount})
+
+
+def _lots_value(lots):
+    return sum(lot["value"] for lot in lots)
+
+
+def _sell_lots_fifo(lots, target_net, remaining_allowance, tax_pct):
+    """
+    Sell from FIFO purchase lots (oldest first) to raise target_net euros net
+    of tax, taxing only the realized gain of each sale at tax_pct and using
+    up remaining_allowance (Sparer-Pauschbetrag) tax-free first.
+
+    Lots currently at a loss are withdrawn tax-free but are not used to
+    offset gains elsewhere (a simplification of Germany's loss-offset rules).
+
+    Mutates `lots` in place. Returns (net_raised, remaining_allowance).
+    """
+    eps = 1e-9
+    tax_rate = 0.01 * tax_pct
+    net_raised = 0.0
+
+    while lots and net_raised < target_net - eps:
+        lot = lots[0]
+        value, cost = lot["value"], lot["cost"]
+        if value <= eps:
+            lots.pop(0)
+            continue
+
+        need = target_net - net_raised
+        gain_rate = max(0.0, (value - cost) / value)
+
+        if gain_rate == 0.0:
+            gross = min(value, need)
+        else:
+            tax_free_gross = remaining_allowance / gain_rate
+            if need <= tax_free_gross:
+                gross = need
+            else:
+                gross = (need - tax_rate * remaining_allowance) / (1 - tax_rate * gain_rate)
+            gross = min(gross, value)
+
+        frac = gross / value
+        cost_sold = cost * frac
+        gain = max(0.0, gross - cost_sold)
+        taxable_gain = max(0.0, gain - remaining_allowance)
+        tax_amount = taxable_gain * tax_rate
+        net = gross - tax_amount
+
+        remaining_allowance = max(0.0, remaining_allowance - gain)
+        lot["value"] -= gross
+        lot["cost"] -= cost_sold
+        if lot["value"] <= eps:
+            lots.pop(0)
+
+        net_raised += net
+
+    return net_raised, remaining_allowance
+
 plt.rcParams.update({
     'font.family': 'Arial',   
     'font.size': 12,
@@ -86,6 +161,8 @@ def run_simulation_portfolio(
         yearly_invest,
         inflation_value,
         tax,
+        tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
+        cashflow_schedule=None,
         pdf_stocks="studentt",
         pdf_fi="gaussian",
         crash=False,
@@ -95,6 +172,13 @@ def run_simulation_portfolio(
         Simulates portfolio path with stocks and fixed income over 'time' years,
         with yearly cashflows, taxes, TER, dividends, inflation, crashes,
         and yearly rebalancing to target allocation.
+
+        Capital gains tax (Abgeltungsteuer) is only ever charged on realized
+        gains, tracked per purchase lot (FIFO), never on the withdrawal of
+        already-taxed principal. Dividends and realized gains share one
+        tax_free_allowance (Sparer-Pauschbetrag) per year. The Vorabpauschale
+        is not modeled since these are assumed to be distributing ETFs, whose
+        distributions are already taxed as dividends here.
 
         Parameters:
             starting_capital (float): Initial total portfolio value.
@@ -110,7 +194,18 @@ def run_simulation_portfolio(
             ter_fi (float): Total expense ratio (%) for fixed income.
             yearly_invest (float): Annual net cashflow to portfolio (>0 add, <0 withdraw).
             inflation_value (float): Starting inflation rate (%).
-            tax (float): Tax rate on dividends and withdrawals (%).
+            tax (float): Capital gains tax rate on dividends and realized gains (%).
+            tax_free_allowance (float): Annual tax-free allowance on capital
+                income (Sparer-Pauschbetrag), shared by dividends and
+                realized gains (€).
+            cashflow_schedule (array-like of float): Optional, length `time`.
+                When given, overrides `yearly_invest` entirely: cashflow_schedule[year]
+                is the exact nominal net cashflow for that year (>0 invest,
+                <0 withdraw), letting the cashflow's sign and size change over
+                the run (e.g. saving while working, withdrawing more before a
+                pension starts, withdrawing less after). Build one with
+                build_life_cashflow_schedule(). Values should already include
+                any desired inflation adjustment.
             pdf_stocks (str): PDF type for stock returns.
             crash (bool): Enable crash simulation.
             crash_prob (float): Annual crash probability (%).
@@ -119,27 +214,37 @@ def run_simulation_portfolio(
             portfolio_values (list): Total portfolio value each year (length time+1).
         """
 
-        # Initial split of capital:
-        capital_stocks = starting_capital * target_stock_allocation
-        capital_fi = starting_capital * (1 - target_stock_allocation)
+        # Initial purchase lots (cost basis = value at simulation start):
+        stock_lots = []
+        fi_lots = []
+        _add_lot(stock_lots, starting_capital * target_stock_allocation)
+        _add_lot(fi_lots, starting_capital * (1 - target_stock_allocation))
 
         portfolio_values = [starting_capital]
 
         inflation_rate = inflation_value
         infl_adj_yearly_invest = yearly_invest
 
-        
+
         effective_threshold = 0.01 * rebalance_threshold if rebalance else 1.0
 
         for year in range(int(time)):
-            
+
+            if cashflow_schedule is not None:
+                infl_adj_yearly_invest = cashflow_schedule[year]
+
+            remaining_allowance = tax_free_allowance
+
             # --- Stocks ---
 
             is_crash = (np.random.rand() < 0.01 * crash_prob) and crash
 
             dividend_adj_stocks = dividend_stocks * (0.5 if is_crash else 1.0)
-            c_div_stocks = capital_stocks * 0.01 * dividend_adj_stocks
-            c_div_after_tax_stocks = c_div_stocks * (1 - 0.01 * tax)
+            c_div_stocks = _lots_value(stock_lots) * 0.01 * dividend_adj_stocks
+
+            taxable_div = max(0.0, c_div_stocks - remaining_allowance)
+            c_div_after_tax_stocks = c_div_stocks - taxable_div * 0.01 * tax
+            remaining_allowance = max(0.0, remaining_allowance - c_div_stocks)
 
             price_return_stocks = av_return_stocks - dividend_adj_stocks
 
@@ -150,20 +255,23 @@ def run_simulation_portfolio(
                     pdf_stocks, price_return_stocks, std_stocks
                 )
 
-            capital_stocks = capital_stocks * yr_return_stocks
+            _grow_lots(stock_lots, yr_return_stocks)
 
             # --- Fixed Income ---
+            # No crash correlation modeled here: the default FI holding (DBX0AN,
+            # an EUR overnight-rate tracker) is cash-like and doesn't reprice on
+            # equity crashes. Revisit if modeling a duration-sensitive bond fund.
 
             price_return_fi = av_return_fi
 
-            if is_crash:
-                yr_return_fi = 0.98 # -2% during crash to model correlation with stocks
-            else:
-                yr_return_fi = annual_return(
-                    pdf_fi, price_return_fi, std_fi
-                )
+            yr_return_fi = annual_return(
+                pdf_fi, price_return_fi, std_fi
+            )
 
-            capital_fi = capital_fi * yr_return_fi
+            _grow_lots(fi_lots, yr_return_fi)
+
+            capital_stocks = _lots_value(stock_lots)
+            capital_fi = _lots_value(fi_lots)
 
             # Calculate current allocation
             total_capital = capital_stocks + capital_fi
@@ -176,8 +284,11 @@ def run_simulation_portfolio(
 
 
             # --- Apply dividends and yearly cashflows ---
+            # Checked on this year's actual cashflow (not the constant `yearly_invest`
+            # parameter) so a cashflow_schedule can switch between saving and
+            # withdrawing over the course of a run.
 
-            if yearly_invest >= 0: # For saving 
+            if infl_adj_yearly_invest >= 0: # For saving
 
                 # Determine underweighted assets
                 understock = diff_stock > effective_threshold
@@ -197,11 +308,11 @@ def run_simulation_portfolio(
                     invest_fi = infl_adj_yearly_invest * (1 - target_stock_allocation)
 
                 # Add infl_adj yearly invest split by target allocation
-                capital_stocks += invest_stock
-                capital_fi += invest_fi
+                _add_lot(stock_lots, invest_stock)
+                _add_lot(fi_lots, invest_fi)
 
-                # Reinvest dividends after tax:
-                capital_stocks += c_div_after_tax_stocks
+                # Reinvest dividends after tax as a new lot:
+                _add_lot(stock_lots, c_div_after_tax_stocks)
 
             else: # Withdrawals:
 
@@ -226,32 +337,48 @@ def run_simulation_portfolio(
                     withdraw_stock = withdrawal * target_stock_allocation
                     withdraw_fi = withdrawal * (1 - target_stock_allocation)
 
-                # Stocks:
+                # Stocks: dividends (already taxed above) cover the withdrawal first,
+                # any remainder is sold FIFO and only the realized gain is taxed.
                 if c_div_after_tax_stocks >= withdraw_stock:
                     surplus = c_div_after_tax_stocks - withdraw_stock
-                    capital_stocks += surplus
+                    _add_lot(stock_lots, surplus)
                 else:
                     remaining_withdrawal_from_stocks = withdraw_stock - c_div_after_tax_stocks
-                    capital_stocks -= remaining_withdrawal_from_stocks / (1 - 0.01 * tax)
+                    _, remaining_allowance = _sell_lots_fifo(
+                        stock_lots, remaining_withdrawal_from_stocks, remaining_allowance, tax
+                    )
 
-                # FI (no dividends):
-                capital_fi -= withdraw_fi / (1 - 0.01 * tax)
+                # FI (no dividends): sold FIFO, only the realized gain is taxed.
+                _, remaining_allowance = _sell_lots_fifo(
+                    fi_lots, withdraw_fi, remaining_allowance, tax
+                )
 
 
             # --- Subtract TER ---
-            capital_stocks *= (1 - 0.01 * ter_stocks)
-            capital_fi *= (1 - 0.01 * ter_fi)
+            _apply_ter_lots(stock_lots, ter_stocks)
+            _apply_ter_lots(fi_lots, ter_fi)
 
             # --- Adjust inflation ---
-            infl_adj_yearly_invest *= (1 + 0.01 * inflation_rate)
+            # (skipped when cashflow_schedule is given: it's overwritten from the
+            # schedule at the top of next year's iteration instead)
+            if cashflow_schedule is None:
+                infl_adj_yearly_invest *= (1 + 0.01 * inflation_rate)
 
             # --- Append ---
-            total_portfolio = capital_stocks + capital_fi
+            total_portfolio = _lots_value(stock_lots) + _lots_value(fi_lots)
             portfolio_values.append(float(total_portfolio))
 
-            # If portfolio depleted and withdrawing, stop early
-            if total_portfolio == 0 and yearly_invest <= 0:
-                portfolio_values.extend([0] * (int(time) - year))
+            # If portfolio depleted and no further inflow could revive it, stop early.
+            # For a schedule, that requires checking every remaining year rather than
+            # just the current one, since a schedule can turn positive again later
+            # (e.g. a pension surplus after retirement spending is covered).
+            if cashflow_schedule is not None:
+                can_stop_early = np.all(cashflow_schedule[year + 1:] <= 0)
+            else:
+                can_stop_early = yearly_invest <= 0
+
+            if total_portfolio == 0 and can_stop_early:
+                portfolio_values.extend([0] * (int(time) - year - 1))
                 break
 
         return portfolio_values
@@ -264,6 +391,8 @@ def run_simulations(n=1000,
                     yearly_invest=10000,
                     inflation_value=0,
                     tax=25,
+                    tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
+                    cashflow_schedule=None,
                     asset_allocation=70,
                     rebalance=True,
                     rebalance_threshold=5,
@@ -272,11 +401,12 @@ def run_simulations(n=1000,
                     std_on_return=13,
                     ter=0.2,
                     dividend=1.4,
-                    average_annual_return_fi=0.5, 
+                    average_annual_return_fi=0.5,
                     std_on_return_fi=0.2,
                     ter_fi=0.1,
-                    crash=False, 
+                    crash=False,
                     crash_prob=3,
+                    seeds=None,
                     progress_callback=None):
     """
     Runs Monte Carlo simulations for a portfolio with stocks and fixed income.
@@ -287,7 +417,13 @@ def run_simulations(n=1000,
         starting_capital (float): Initial portfolio value.
         yearly_invest (float): Annual contribution (positive) or withdrawal (negative).
         inflation_value (float): Initial inflation rate (%).
-        tax (float): Tax rate (%) on dividends and withdrawals.
+        tax (float): Capital gains tax rate (%) on dividends and realized gains.
+        tax_free_allowance (float): Annual tax-free allowance on capital
+            income (Sparer-Pauschbetrag), shared by dividends and realized
+            gains (€).
+        cashflow_schedule (array-like of float): Optional, length `time`.
+            Overrides `yearly_invest` with a per-year nominal net cashflow
+            (see run_simulation_portfolio / build_life_cashflow_schedule).
         asset_allocation (float): % of portfolio in stocks.
         rebalance (bool): Rebalance portfolio yearly to target allocation.
         pdf (str): Distribution type for returns ("studentt" or "gaussian").
@@ -300,13 +436,19 @@ def run_simulations(n=1000,
         ter_fi (float): FI total expense ratio (%).
         crash (bool): Enable crash simulation.
         crash_prob (float): Annual crash probability (%).
+        seeds (array-like of int): Optional, one RNG seed per path (length n).
+            When given, path i always draws the exact same sequence of random
+            returns regardless of other parameters (common random numbers).
+            Used by the goal-seek solvers below so that the probability of
+            success is a smooth, monotonic function of the searched-over
+            variable instead of fresh Monte Carlo noise at every trial.
         progress_callback (callable): Optional callback for progress updates (0 to 1).
 
     Returns:
         runs (np.array): Simulated portfolio values (n x (time+1)).
         comp_run (np.array): Deterministic composite portfolio run (time+1).
         capital_run (np.array): Baseline run with zero returns, only cash flows.
-    """    
+    """
 
     # Convert percentage:
     target_stock_allocation=asset_allocation*0.01
@@ -328,6 +470,8 @@ def run_simulations(n=1000,
         yearly_invest=yearly_invest,
         inflation_value=inflation_value,
         tax=tax,
+        tax_free_allowance=tax_free_allowance,
+        cashflow_schedule=cashflow_schedule,
         pdf_stocks=pdf,
         pdf_fi="gaussian",
         crash=False,
@@ -351,6 +495,8 @@ def run_simulations(n=1000,
         yearly_invest=yearly_invest,
         inflation_value=inflation_value,
         tax=tax,
+        tax_free_allowance=tax_free_allowance,
+        cashflow_schedule=cashflow_schedule,
         pdf_stocks="gaussian",
         pdf_fi="gaussian",
         crash=False,
@@ -360,7 +506,10 @@ def run_simulations(n=1000,
     # Compute portfolio development:
     runs = []
     for i in range(n):
-        
+
+        if seeds is not None:
+            np.random.seed(int(seeds[i]))
+
         # Run one portfolio simulation path
         sim = run_simulation_portfolio(
             starting_capital=starting_capital,
@@ -378,6 +527,8 @@ def run_simulations(n=1000,
             yearly_invest=yearly_invest,
             inflation_value=inflation_value,
             tax=tax,
+            tax_free_allowance=tax_free_allowance,
+            cashflow_schedule=cashflow_schedule,
             pdf_stocks=pdf,
             pdf_fi="gaussian",
             crash=crash,
@@ -391,6 +542,274 @@ def run_simulations(n=1000,
             progress_callback((i + 1) / n)
 
     return runs, comp_run, capital_run
+
+
+def build_life_cashflow_schedule(
+        time,
+        inflation_value,
+        retirement_year,
+        accumulation_savings,
+        retirement_spending,
+        gesetzliche_rente=0.0,
+        gesetzliche_rente_start_year=None,
+        betriebliche_rente=0.0,
+        betriebliche_rente_start_year=None,
+    ):
+    """
+    Builds a length-`time` array of nominal yearly net cashflows (>0 invest,
+    <0 withdraw) for a full life simulation: saving while working, then
+    withdrawing in retirement, with up to two pension streams (gesetzliche
+    and betriebliche Rente) each switching on at their own year and reducing
+    the amount that needs to be withdrawn from the portfolio.
+
+    All amounts are given in today's euros. Before `retirement_year`, the
+    cashflow is +accumulation_savings. From `retirement_year` onward it's
+    -(retirement_spending minus whichever pensions have started that year).
+    A pension only ever applies from retirement_year onward even if its own
+    start year is (mis)configured earlier.
+
+    Every component compounds with inflation from year 0 the same way a
+    single constant yearly_invest already does elsewhere in this module —
+    a pension quoted "starting at 67" and a spending need quoted "from day
+    one" both scale by (1+inflation)^year, so no separate date-shifting is
+    needed beyond an on/off flag per year.
+
+    Returns:
+        schedule (np.array): length-`time` nominal cashflow per year.
+    """
+    years = np.arange(int(time))
+    inflation_factor = (1 + 0.01 * inflation_value) ** years
+
+    real_cashflow = np.where(
+        years < retirement_year,
+        float(accumulation_savings),
+        -float(retirement_spending),
+    )
+
+    if gesetzliche_rente_start_year is not None:
+        active = (years >= retirement_year) & (years >= gesetzliche_rente_start_year)
+        real_cashflow = real_cashflow + active * gesetzliche_rente
+
+    if betriebliche_rente_start_year is not None:
+        active = (years >= retirement_year) & (years >= betriebliche_rente_start_year)
+        real_cashflow = real_cashflow + active * betriebliche_rente
+
+    return real_cashflow * inflation_factor
+
+
+def _bisect_for_probability(evaluate, target, lo, hi, tol, max_iter,
+                             expand=True, max_expansions=20,
+                             progress_callback=None):
+    """
+    Generic bisection over a scalar x, assuming `evaluate(x)` returns a
+    (probability, runs) tuple where probability is non-decreasing in x.
+    Finds the smallest x in [lo, hi] with probability >= target.
+
+    If expand=True, `hi` is doubled (up to max_expansions times) until
+    evaluate(hi) clears the target, auto-bracketing cases where the initial
+    upper bound guess was too low.
+
+    Returns (x, probability_at_x, runs_at_x, bracketed). `bracketed` is False
+    if target could not be reached even at the (possibly expanded) `hi` —
+    the returned value is then a best-effort result, not a true solution.
+    """
+    lo_prob, lo_runs = evaluate(lo)
+    if lo_prob >= target:
+        return lo, lo_prob, lo_runs, True
+
+    hi_prob, hi_runs = evaluate(hi)
+    expansions = 0
+    while expand and hi_prob < target and expansions < max_expansions:
+        hi *= 2
+        hi_prob, hi_runs = evaluate(hi)
+        expansions += 1
+
+    if hi_prob < target:
+        return hi, hi_prob, hi_runs, False
+
+    for i in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        mid_prob, mid_runs = evaluate(mid)
+
+        if mid_prob >= target:
+            hi, hi_prob, hi_runs = mid, mid_prob, mid_runs
+        else:
+            lo, lo_prob, lo_runs = mid, mid_prob, mid_runs
+
+        if progress_callback is not None:
+            progress_callback((i + 1) / max_iter)
+
+        if hi - lo < tol:
+            break
+
+    return hi, hi_prob, hi_runs, True
+
+
+def solve_required_savings(
+        target_net_worth,
+        target_probability,
+        time,
+        starting_capital,
+        inflation_value=0,
+        tax=25,
+        tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
+        asset_allocation=70,
+        rebalance=True,
+        rebalance_threshold=5,
+        pdf="studentt",
+        average_annual_return=5,
+        std_on_return=13,
+        ter=0.2,
+        dividend=1.4,
+        average_annual_return_fi=0.5,
+        std_on_return_fi=0.2,
+        ter_fi=0.1,
+        crash=False,
+        crash_prob=3,
+        n=300,
+        max_iter=30,
+        upper_bound=None,
+        progress_callback=None,
+    ):
+    """
+    Solves for the constant (inflation-adjusted) yearly investment needed so
+    that, over `time` years, P(final portfolio value >= target_net_worth) is
+    approximately target_probability / 100.
+
+    Uses bisection with common random numbers: every candidate yearly
+    investment is evaluated against the exact same n simulated return paths
+    (see `seeds` in run_simulations), which makes the success probability a
+    smooth, monotonic function of the amount invested, so a plain bisection
+    search converges reliably instead of chasing fresh Monte Carlo noise at
+    every trial.
+
+    Parameters:
+        target_net_worth (float): Goal portfolio value (€) at year `time`.
+        target_probability (float): Desired chance of reaching the goal (%).
+        n (int): Simulated paths per bisection iteration. Kept low by
+            default since a full search evaluates it many times; raise for a
+            more precise estimate at the cost of runtime.
+        max_iter (int): Maximum bisection iterations.
+        upper_bound (float): Optional cap on the initial yearly-investment
+            search range (€); auto-expanded if too low. Defaults to a rough
+            heuristic based on the target.
+        progress_callback (callable): Optional callback (0 to 1), called
+            once per bisection iteration.
+        (all other parameters match run_simulations, minus yearly_invest)
+
+    Returns:
+        required_savings (float): Smallest yearly investment (€) achieving
+            at least target_probability, within the search bounds.
+        achieved_probability (float): Actual success probability at that
+            investment level, given the n simulated paths used.
+        runs (list): Simulated portfolio paths at the solved investment level.
+        bracketed (bool): False if target_probability could not be reached
+            even at the (expanded) upper bound — result is a best-effort
+            value, not a true solution.
+    """
+    seeds = np.random.randint(0, 2**31 - 1, size=n)
+    target = 0.01 * target_probability
+    hi = upper_bound or max(target_net_worth / max(time, 1), 1000.0)
+    tol = max(1.0, 0.0005 * hi)
+
+    def evaluate(yearly_invest):
+        runs, _, _ = run_simulations(
+            n=n, time=time, starting_capital=starting_capital,
+            yearly_invest=yearly_invest, inflation_value=inflation_value,
+            tax=tax, tax_free_allowance=tax_free_allowance,
+            asset_allocation=asset_allocation, rebalance=rebalance,
+            rebalance_threshold=rebalance_threshold, pdf=pdf,
+            average_annual_return=average_annual_return, std_on_return=std_on_return,
+            ter=ter, dividend=dividend, average_annual_return_fi=average_annual_return_fi,
+            std_on_return_fi=std_on_return_fi, ter_fi=ter_fi,
+            crash=crash, crash_prob=crash_prob, seeds=seeds,
+        )
+        final_values = np.array([r[-1] for r in runs])
+        return float(np.mean(final_values >= target_net_worth)), runs
+
+    return _bisect_for_probability(
+        evaluate, target, lo=0.0, hi=hi, tol=tol, max_iter=max_iter,
+        progress_callback=progress_callback,
+    )
+
+
+def solve_max_withdrawal(
+        starting_capital,
+        time,
+        max_bankruptcy_probability,
+        inflation_value=0,
+        tax=25,
+        tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
+        asset_allocation=70,
+        rebalance=True,
+        rebalance_threshold=5,
+        pdf="studentt",
+        average_annual_return=5,
+        std_on_return=13,
+        ter=0.2,
+        dividend=1.4,
+        average_annual_return_fi=0.5,
+        std_on_return_fi=0.2,
+        ter_fi=0.1,
+        crash=False,
+        crash_prob=3,
+        n=300,
+        max_iter=30,
+        progress_callback=None,
+    ):
+    """
+    Solves for the largest constant (inflation-adjusted) yearly withdrawal
+    such that, over `time` years, P(portfolio depleted to 0 at any point) is
+    approximately max_bankruptcy_probability / 100.
+
+    Since the simulator holds a depleted portfolio at 0 for all remaining
+    years (see run_simulation_portfolio), checking the final year's value is
+    equivalent to checking whether it was ever depleted. Uses the same
+    common-random-numbers bisection as solve_required_savings.
+
+    Parameters:
+        max_bankruptcy_probability (float): Acceptable chance of running out
+            of money by year `time` (%).
+        n (int): Simulated paths per bisection iteration. Kept low by
+            default since a full search evaluates it many times; raise for a
+            more precise estimate at the cost of runtime.
+        max_iter (int): Maximum bisection iterations.
+        progress_callback (callable): Optional callback (0 to 1), called
+            once per bisection iteration.
+        (all other parameters match run_simulations, minus yearly_invest)
+
+    Returns:
+        max_withdrawal (float): Largest sustainable yearly withdrawal (€).
+        achieved_probability (float): Actual bankruptcy probability at that
+            withdrawal level, given the n simulated paths used.
+        runs (list): Simulated portfolio paths at the solved withdrawal level.
+        bracketed (bool): False if even withdrawing the entire starting
+            capital every year stays under the target probability, in which
+            case the result is a best-effort value, not a true solution.
+    """
+    seeds = np.random.randint(0, 2**31 - 1, size=n)
+    target = 0.01 * max_bankruptcy_probability
+    tol = max(1.0, 0.0005 * starting_capital)
+
+    def evaluate(withdrawal):
+        runs, _, _ = run_simulations(
+            n=n, time=time, starting_capital=starting_capital,
+            yearly_invest=-withdrawal, inflation_value=inflation_value,
+            tax=tax, tax_free_allowance=tax_free_allowance,
+            asset_allocation=asset_allocation, rebalance=rebalance,
+            rebalance_threshold=rebalance_threshold, pdf=pdf,
+            average_annual_return=average_annual_return, std_on_return=std_on_return,
+            ter=ter, dividend=dividend, average_annual_return_fi=average_annual_return_fi,
+            std_on_return_fi=std_on_return_fi, ter_fi=ter_fi,
+            crash=crash, crash_prob=crash_prob, seeds=seeds,
+        )
+        final_values = np.array([r[-1] for r in runs])
+        return float(np.mean(final_values <= 0.0)), runs
+
+    return _bisect_for_probability(
+        evaluate, target, lo=0.0, hi=starting_capital, tol=tol, max_iter=max_iter,
+        progress_callback=progress_callback,
+    )
 
 
 def plot_simulations(year,

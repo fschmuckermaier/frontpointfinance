@@ -2,4 +2,7 @@ numpy==2.2.1
 matplotlib==3.10.0
 scipy==1.15.0
 streamlit==1.51.0
-plotly==5.0.0
+plotly==6.5.0
+pandas==2.3.3
+kaleido==0.2.1
+fpdf2==2.8.7
