@@ -7,6 +7,27 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 GERMAN_TAX_FREE_ALLOWANCE = 1000  # Sparer-Pauschbetrag per year, single filer (since 2023)
+GERMAN_SOLI_RATE = 0.055  # Solidaritätszuschlag: mandatory 5.5% surcharge on capital-gains tax
+GERMAN_TEILFREISTELLUNG_EQUITY = 0.30  # §20 InvStG partial exemption for equity funds (≥51% stock)
+
+STUDENT_T_DF = 5  # degrees of freedom for the stock-return innovation distribution
+
+# The Student-t-in-the-exponent construction used for stock returns has a
+# theoretically infinite mean (power-law tails), so a small fraction of draws
+# would otherwise be absurd (a +2,710% single-year return was observed once
+# in 200k draws) — and, less obviously, it also *inflates* the realized
+# arithmetic volatility well above the input std parameter (empirically
+# ~19% realized for a 16% input, unstably so: a single extreme draw can
+# swing the sample variance by an order of magnitude). Truncating the
+# innovation at ±STUDENT_T_TRUNCATION_K standard deviations before
+# exponentiating fixes both: it was calibrated empirically so realized
+# arithmetic std matches the input std to within ~1% across the whole
+# 5-30% slider range, and it removes the pathological outliers. Severe
+# crash years (2008/2020-style, beyond what this "normal" distribution
+# produces) are still reachable via the separate explicit crash toggle.
+STUDENT_T_TRUNCATION_K = 4.2
+_STUDENT_T_LO_CDF = t.cdf(-STUDENT_T_TRUNCATION_K, df=STUDENT_T_DF)
+_STUDENT_T_HI_CDF = t.cdf(STUDENT_T_TRUNCATION_K, df=STUDENT_T_DF)
 
 
 def _grow_lots(lots, factor):
@@ -29,11 +50,33 @@ def _lots_value(lots):
     return sum(lot["value"] for lot in lots)
 
 
-def _sell_lots_fifo(lots, target_net, remaining_allowance, tax_pct):
+def ever_depleted(runs, upto_idx=None):
+    """
+    True for each path in `runs` that hit <= 0 at any point up to and
+    including index `upto_idx` (default: the whole path).
+
+    Checking the full path (not just its final or selected-year value)
+    matters whenever a cashflow_schedule can revive a depleted portfolio
+    later (e.g. a pension surplus after retirement spending is covered) —
+    otherwise a path that went broke for years would be counted as a
+    success just because it recovered by the end.
+    """
+    end = None if upto_idx is None else upto_idx + 1
+    return np.array([np.any(np.asarray(r[:end]) <= 0) for r in runs])
+
+
+def _sell_lots_fifo(lots, target_net, remaining_allowance, tax_pct, teilfreistellung_rate=0.0):
     """
     Sell from FIFO purchase lots (oldest first) to raise target_net euros net
     of tax, taxing only the realized gain of each sale at tax_pct and using
     up remaining_allowance (Sparer-Pauschbetrag) tax-free first.
+
+    teilfreistellung_rate (§20 InvStG partial exemption, e.g. 0.30 for an
+    equity fund, 0.0 for a fund type that doesn't qualify) shields that
+    fraction of each gain from tax entirely, before the allowance is
+    applied — matching how German brokers compute Vorabpauschale/
+    Kapitalertragsteuer withholding: the exemption reduces the taxable
+    amount first, and only the remainder draws on the Sparer-Pauschbetrag.
 
     Lots currently at a loss are withdrawn tax-free but are not used to
     offset gains elsewhere (a simplification of Germany's loss-offset rules).
@@ -53,25 +96,27 @@ def _sell_lots_fifo(lots, target_net, remaining_allowance, tax_pct):
 
         need = target_net - net_raised
         gain_rate = max(0.0, (value - cost) / value)
+        taxable_gain_rate = gain_rate * (1 - teilfreistellung_rate)
 
-        if gain_rate == 0.0:
+        if taxable_gain_rate == 0.0:
             gross = min(value, need)
         else:
-            tax_free_gross = remaining_allowance / gain_rate
+            tax_free_gross = remaining_allowance / taxable_gain_rate
             if need <= tax_free_gross:
                 gross = need
             else:
-                gross = (need - tax_rate * remaining_allowance) / (1 - tax_rate * gain_rate)
+                gross = (need - tax_rate * remaining_allowance) / (1 - tax_rate * taxable_gain_rate)
             gross = min(gross, value)
 
         frac = gross / value
         cost_sold = cost * frac
         gain = max(0.0, gross - cost_sold)
-        taxable_gain = max(0.0, gain - remaining_allowance)
+        taxable_gain_gross = gain * (1 - teilfreistellung_rate)
+        taxable_gain = max(0.0, taxable_gain_gross - remaining_allowance)
         tax_amount = taxable_gain * tax_rate
         net = gross - tax_amount
 
-        remaining_allowance = max(0.0, remaining_allowance - gain)
+        remaining_allowance = max(0.0, remaining_allowance - taxable_gain_gross)
         lot["value"] -= gross
         lot["cost"] -= cost_sold
         if lot["value"] <= eps:
@@ -94,27 +139,34 @@ def annual_return(pdf, price_return, std):
     Parameters:
         pdf (str): Type of distribution to sample returns from. Options:
                    - "gaussian": Normal distribution on arithmetic returns.
-                   - "studentt": Student's t-distribution on log-returns with autocorrelation.
+                   - "studentt": Student's t-distribution on log-returns,
+                     truncated at +/-STUDENT_T_TRUNCATION_K standard
+                     deviations so realized arithmetic volatility matches
+                     `std` (see that constant's comment for why).
         price_return (float): Expected annual price return in percentage (e.g., 5 for 5%).
         std (float): Standard deviation of the returns in percentage.
-        
+
     Returns:
         yr_return (float): Simulated annual return as a multiplier (e.g., 1.05 for +5%).
     """
 
     if pdf=="gaussian":
         yr_mult=np.random.normal(price_return, std, 1)[0]
-        yr_return=1+0.01*yr_mult
+        yr_return=max(0.0, 1+0.01*yr_mult)  # a return below -100% isn't meaningful for a holding
         current_log_ret=None
         
     if pdf == "studentt":
-        nu = 5
         mu_log = np.log(1 + price_return * 0.01) - 0.5 * (std * 0.01) ** 2
-        scale_log = std * 0.01 * np.sqrt((nu - 2) / nu)  # variance correction
+        scale_log = std * 0.01 * np.sqrt((STUDENT_T_DF - 2) / STUDENT_T_DF)  # variance correction
 
-        # Draw innovation noise epsilon_t ~ Student-t with mean 0
-        t_dist = t(df=nu, loc=mu_log, scale=scale_log)
-        current_log_ret = t_dist.rvs()
+        # Draw innovation noise epsilon_t ~ Student-t with mean 0, truncated
+        # at +/-STUDENT_T_TRUNCATION_K standard deviations (see the constant's
+        # comment above for why). Sampling via inverse-CDF on the *standard*
+        # t distribution (df only, no loc/scale) and rescaling afterwards
+        # keeps this to one scipy call per draw instead of two.
+        u = np.random.uniform(_STUDENT_T_LO_CDF, _STUDENT_T_HI_CDF)
+        standard_t_draw = t.ppf(u, df=STUDENT_T_DF)
+        current_log_ret = mu_log + scale_log * standard_t_draw
 
         yr_return = np.exp(current_log_ret)
 
@@ -180,6 +232,12 @@ def run_simulation_portfolio(
         is not modeled since these are assumed to be distributing ETFs, whose
         distributions are already taxed as dividends here.
 
+        `tax` is treated as the base Abgeltungsteuer rate; the mandatory
+        5.5% Solidaritätszuschlag is always added on top (GERMAN_SOLI_RATE),
+        and stock gains/dividends additionally get the 30% Teilfreistellung
+        equity-fund exemption (GERMAN_TEILFREISTELLUNG_EQUITY, §20 InvStG) —
+        the FI holding doesn't qualify (money-market funds get 0%).
+
         Parameters:
             starting_capital (float): Initial total portfolio value.
             time (int): Number of years to simulate.
@@ -220,6 +278,8 @@ def run_simulation_portfolio(
         _add_lot(stock_lots, starting_capital * target_stock_allocation)
         _add_lot(fi_lots, starting_capital * (1 - target_stock_allocation))
 
+        effective_tax = tax * (1 + GERMAN_SOLI_RATE)  # bakes in Soli; see docstring
+
         portfolio_values = [starting_capital]
 
         inflation_rate = inflation_value
@@ -242,9 +302,12 @@ def run_simulation_portfolio(
             dividend_adj_stocks = dividend_stocks * (0.5 if is_crash else 1.0)
             c_div_stocks = _lots_value(stock_lots) * 0.01 * dividend_adj_stocks
 
-            taxable_div = max(0.0, c_div_stocks - remaining_allowance)
-            c_div_after_tax_stocks = c_div_stocks - taxable_div * 0.01 * tax
-            remaining_allowance = max(0.0, remaining_allowance - c_div_stocks)
+            # Teilfreistellung shields 30% of the distribution before the
+            # allowance is applied, same ordering as _sell_lots_fifo.
+            taxable_div_gross = c_div_stocks * (1 - GERMAN_TEILFREISTELLUNG_EQUITY)
+            taxable_div = max(0.0, taxable_div_gross - remaining_allowance)
+            c_div_after_tax_stocks = c_div_stocks - taxable_div * 0.01 * effective_tax
+            remaining_allowance = max(0.0, remaining_allowance - taxable_div_gross)
 
             price_return_stocks = av_return_stocks - dividend_adj_stocks
 
@@ -345,12 +408,15 @@ def run_simulation_portfolio(
                 else:
                     remaining_withdrawal_from_stocks = withdraw_stock - c_div_after_tax_stocks
                     _, remaining_allowance = _sell_lots_fifo(
-                        stock_lots, remaining_withdrawal_from_stocks, remaining_allowance, tax
+                        stock_lots, remaining_withdrawal_from_stocks, remaining_allowance,
+                        effective_tax, teilfreistellung_rate=GERMAN_TEILFREISTELLUNG_EQUITY,
                     )
 
                 # FI (no dividends): sold FIFO, only the realized gain is taxed.
+                # No Teilfreistellung here — a money-market/cash-like fund
+                # doesn't qualify for the equity-fund exemption tier.
                 _, remaining_allowance = _sell_lots_fifo(
-                    fi_lots, withdraw_fi, remaining_allowance, tax
+                    fi_lots, withdraw_fi, remaining_allowance, effective_tax, teilfreistellung_rate=0.0
                 )
 
 
@@ -515,7 +581,7 @@ def run_simulations(n=1000,
             starting_capital=starting_capital,
             time=time,
             target_stock_allocation=target_stock_allocation,
-            rebalance=True,
+            rebalance=rebalance,
             rebalance_threshold=rebalance_threshold,
             av_return_stocks=average_annual_return,
             std_stocks=std_on_return,
@@ -544,6 +610,44 @@ def run_simulations(n=1000,
     return runs, comp_run, capital_run
 
 
+def sweep_allocation(allocations, n, seeds=None, progress_callback=None, **kwargs):
+    """
+    Runs a batch of n simulations at each stock allocation in `allocations`
+    (0-100), all against the same seeds, holding every other parameter
+    (including cashflow) fixed. This answers "given my current plan, how
+    does risk/outcome change with stock/bond mix" — not "how much would I
+    need to save/withdraw at each mix", which would require re-solving at
+    every point and is far more expensive.
+
+    Parameters:
+        allocations (iterable of float): Stock allocations to test (%).
+        n (int): Simulated paths per allocation.
+        seeds (array-like of int): Optional, shared across every allocation
+            (see `seeds` in run_simulations) so results are directly
+            comparable point to point instead of differing by fresh
+            Monte Carlo noise.
+        progress_callback (callable): Optional callback (0 to 1), called
+            once per allocation tested.
+        **kwargs: Forwarded to run_simulations (all parameters except
+            asset_allocation, n, and seeds, which are set here).
+
+    Returns:
+        results (list of (allocation, runs)): One entry per allocation
+            tested, in the given order.
+    """
+    if seeds is None:
+        seeds = np.random.randint(0, 2**31 - 1, size=n)
+
+    results = []
+    for i, alloc in enumerate(allocations):
+        runs, _, _ = run_simulations(n=n, asset_allocation=alloc, seeds=seeds, **kwargs)
+        results.append((alloc, runs))
+        if progress_callback is not None:
+            progress_callback((i + 1) / len(allocations))
+
+    return results
+
+
 def build_life_cashflow_schedule(
         time,
         inflation_value,
@@ -554,6 +658,7 @@ def build_life_cashflow_schedule(
         gesetzliche_rente_start_year=None,
         betriebliche_rente=0.0,
         betriebliche_rente_start_year=None,
+        events=None,
     ):
     """
     Builds a length-`time` array of nominal yearly net cashflows (>0 invest,
@@ -574,6 +679,18 @@ def build_life_cashflow_schedule(
     one" both scale by (1+inflation)^year, so no separate date-shifting is
     needed beyond an on/off flag per year.
 
+    Parameters:
+        events (iterable of (year_offset, amount, repeat_every, until_year)):
+            Optional one-off or recurring lumpy cashflows (house purchase,
+            inheritance, car replacement, ...), each in today's euros and
+            given as a year-offset from year 0 (like every other time
+            argument here, not an age — convert age - current_age before
+            calling). amount > 0 is an inflow, < 0 an expense.
+            repeat_every: 0/None for a one-time event, otherwise the event
+            recurs every `repeat_every` years starting at `year_offset` up
+            to (but not including) `until_year` (defaults to `time` if
+            None). Events falling outside [0, time) are ignored.
+
     Returns:
         schedule (np.array): length-`time` nominal cashflow per year.
     """
@@ -593,6 +710,17 @@ def build_life_cashflow_schedule(
     if betriebliche_rente_start_year is not None:
         active = (years >= retirement_year) & (years >= betriebliche_rente_start_year)
         real_cashflow = real_cashflow + active * betriebliche_rente
+
+    if events:
+        for year_offset, amount, repeat_every, until_year in events:
+            if repeat_every:
+                last = until_year if until_year is not None else time
+                years_hit = np.arange(year_offset, last, repeat_every)
+            else:
+                years_hit = [year_offset]
+            for y in years_hit:
+                if 0 <= y < time:
+                    real_cashflow[int(y)] += amount
 
     return real_cashflow * inflation_factor
 
@@ -762,10 +890,9 @@ def solve_max_withdrawal(
     such that, over `time` years, P(portfolio depleted to 0 at any point) is
     approximately max_bankruptcy_probability / 100.
 
-    Since the simulator holds a depleted portfolio at 0 for all remaining
-    years (see run_simulation_portfolio), checking the final year's value is
-    equivalent to checking whether it was ever depleted. Uses the same
-    common-random-numbers bisection as solve_required_savings.
+    Uses ever_depleted to check the full path rather than just its final
+    value, and the same common-random-numbers bisection as
+    solve_required_savings.
 
     Parameters:
         max_bankruptcy_probability (float): Acceptable chance of running out
@@ -803,13 +930,137 @@ def solve_max_withdrawal(
             std_on_return_fi=std_on_return_fi, ter_fi=ter_fi,
             crash=crash, crash_prob=crash_prob, seeds=seeds,
         )
-        final_values = np.array([r[-1] for r in runs])
-        return float(np.mean(final_values <= 0.0)), runs
+        return float(np.mean(ever_depleted(runs))), runs
 
     return _bisect_for_probability(
         evaluate, target, lo=0.0, hi=starting_capital, tol=tol, max_iter=max_iter,
         progress_callback=progress_callback,
     )
+
+
+def solve_retirement_age(
+        current_age,
+        plan_until_age,
+        target_probability,
+        starting_capital,
+        accumulation_savings,
+        retirement_spending,
+        inflation_value=0,
+        gesetzliche_rente=0.0,
+        gesetzliche_rente_start_age=None,
+        betriebliche_rente=0.0,
+        betriebliche_rente_start_age=None,
+        tax=25,
+        tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
+        asset_allocation=70,
+        rebalance=True,
+        rebalance_threshold=5,
+        pdf="studentt",
+        average_annual_return=5,
+        std_on_return=13,
+        ter=0.2,
+        dividend=1.4,
+        average_annual_return_fi=0.5,
+        std_on_return_fi=0.2,
+        ter_fi=0.1,
+        crash=False,
+        crash_prob=3,
+        life_events=None,
+        n=300,
+        max_iter=25,
+        progress_callback=None,
+    ):
+    """
+    Solves for the earliest retirement age such that, over the horizon from
+    current_age to plan_until_age, P(portfolio never depleted) is
+    approximately target_probability / 100.
+
+    Uses the same common-random-numbers bisection as solve_required_savings
+    / solve_max_withdrawal: every candidate retirement year is evaluated
+    against the exact same n simulated return paths, which makes the success
+    probability a smooth, monotonic function of the retirement year (more
+    accumulation years and/or fewer decumulation years both raise it), so a
+    plain bisection converges reliably.
+
+    Parameters:
+        current_age (int): Age the plan starts at.
+        plan_until_age (int): Age the plan ends at (horizon = plan_until_age
+            - current_age).
+        target_probability (float): Desired chance of never depleting the
+            portfolio (%).
+        accumulation_savings, retirement_spending: see
+            build_life_cashflow_schedule.
+        gesetzliche_rente_start_age / betriebliche_rente_start_age (int):
+            Absolute ages, converted to year-offsets internally. A pension
+            still only applies from retirement onward even if its own start
+            age is earlier (see build_life_cashflow_schedule) — so these can
+            be set independently of the retirement age being solved for.
+        life_events: see build_life_cashflow_schedule's `events` (already
+            year-offsets, i.e. already converted from ages by the caller).
+        n (int): Simulated paths per bisection iteration.
+        max_iter (int): Maximum bisection iterations.
+        progress_callback (callable): Optional callback (0 to 1), called
+            once per bisection iteration.
+        (all other parameters match run_simulations)
+
+    Returns:
+        retirement_age (int): Earliest retirement age achieving at least
+            target_probability, within [current_age, plan_until_age].
+        achieved_probability (float): Actual never-depleted probability at
+            that retirement age, given the n simulated paths used.
+        runs (list): Simulated portfolio paths at the solved retirement age.
+        bracketed (bool): False if even retiring at plan_until_age (the
+            latest possible age) could not reach target_probability — result
+            is a best-effort value, not a true solution.
+    """
+    time = plan_until_age - current_age
+    seeds = np.random.randint(0, 2**31 - 1, size=n)
+    target = 0.01 * target_probability
+
+    def evaluate(retirement_year):
+        ry = int(round(retirement_year))
+        schedule = build_life_cashflow_schedule(
+            time=time,
+            inflation_value=inflation_value,
+            retirement_year=ry,
+            accumulation_savings=accumulation_savings,
+            retirement_spending=retirement_spending,
+            gesetzliche_rente=gesetzliche_rente,
+            gesetzliche_rente_start_year=(
+                gesetzliche_rente_start_age - current_age
+                if gesetzliche_rente_start_age is not None else None
+            ),
+            betriebliche_rente=betriebliche_rente,
+            betriebliche_rente_start_year=(
+                betriebliche_rente_start_age - current_age
+                if betriebliche_rente_start_age is not None else None
+            ),
+            events=life_events,
+        )
+        runs, _, _ = run_simulations(
+            n=n, time=time, starting_capital=starting_capital,
+            yearly_invest=0, cashflow_schedule=schedule,
+            inflation_value=inflation_value, tax=tax,
+            tax_free_allowance=tax_free_allowance,
+            asset_allocation=asset_allocation, rebalance=rebalance,
+            rebalance_threshold=rebalance_threshold, pdf=pdf,
+            average_annual_return=average_annual_return, std_on_return=std_on_return,
+            ter=ter, dividend=dividend, average_annual_return_fi=average_annual_return_fi,
+            std_on_return_fi=std_on_return_fi, ter_fi=ter_fi,
+            crash=crash, crash_prob=crash_prob, seeds=seeds,
+        )
+        return float(np.mean(~ever_depleted(runs))), runs
+
+    # hi is capped at time - 1, not time: retirement_year == time would mean
+    # zero decumulation years get simulated (the withdrawal phase never
+    # starts before the horizon ends), which trivially "succeeds" without
+    # actually testing whether retirement is affordable at all.
+    retirement_year, achieved_prob, runs, bracketed = _bisect_for_probability(
+        evaluate, target, lo=0.0, hi=float(max(time - 1, 0)), tol=0.5, max_iter=max_iter,
+        expand=False,  # domain is already bounded by plan_until_age
+        progress_callback=progress_callback,
+    )
+    return current_age + int(round(retirement_year)), achieved_prob, runs, bracketed
 
 
 def plot_simulations(year,
@@ -948,8 +1199,10 @@ def plot_simulations(year,
         col=1, row=1
     )
 
-    # Highlight 10 random paths
-    for i in [2, 3, 4, 5, 6,7,8,9,10,11]:
+    # Highlight up to 10 random paths (fewer if there aren't that many runs).
+    sample_indices = list(range(min(10, len(runs))))
+    sample_label = f"{len(sample_indices)} random path{'s' if len(sample_indices) != 1 else ''} (click to show)"
+    for idx, i in enumerate(sample_indices):
         fig.add_trace(
             go.Scatter(
                 x=years,
@@ -958,8 +1211,8 @@ def plot_simulations(year,
                 line=dict(color="black", width=1),
                 opacity=0.5,
                 visible='legendonly',  # hidden initially
-                showlegend=(i == 2),   # only first trace shows legend entry
-                name="10 random paths (click to show)",
+                showlegend=(idx == 0),  # only first trace shows legend entry
+                name=sample_label,
                 legendgroup="random_paths"  # group them
             ),
             col=1, row=1
@@ -1010,7 +1263,11 @@ def plot_simulations(year,
     )
 
     # --- Statistics ---
-    prob_bankr = 100 * np.mean(values_at_year <= 0)
+    # Bankrupt-by-this-year, not just zero-at-this-year: a cashflow_schedule
+    # (life mode) can revive a depleted portfolio later via a pension
+    # surplus, so only looking at the selected year's value would miss
+    # years spent at zero before any such revival.
+    prob_bankr = 100 * np.mean(ever_depleted(runs, upto_idx=idx_year))
     median = np.median(values_at_year)
     p10 = np.percentile(values_at_year, 10)
     p25 = np.percentile(values_at_year, 25)
@@ -1138,6 +1395,61 @@ def plot_simulations(year,
     fig.update_yaxes(
         range=[0, y_high],
         col=2
+    )
+
+    return fig
+
+
+def plot_allocation_sweep(alloc_results, metric_fn, metric_label, current_allocation):
+    """
+    Plot a metric (e.g. success probability, median final value) against
+    stock allocation, from a sweep_allocation() result.
+
+    Parameters:
+        alloc_results (list of (allocation, runs)): Output of
+            sweep_allocation().
+        metric_fn (callable): Maps a batch of runs to a single scalar
+            (e.g. lambda runs: np.mean(~ever_depleted(runs))).
+        metric_label (str): Y-axis / hover label for the metric, e.g.
+            "Chance of never depleting the portfolio (%)".
+        current_allocation (float): The allocation actually used in the
+            main result, marked with a vertical line for reference.
+
+    Returns:
+        fig (plotly.graph_objects.Figure)
+    """
+    allocations = [alloc for alloc, _ in alloc_results]
+    metric_values = [metric_fn(runs) for _, runs in alloc_results]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=allocations,
+            y=metric_values,
+            mode="lines+markers",
+            line=dict(color="navy", width=2),
+            marker=dict(size=7),
+            name=metric_label,
+            hovertemplate=f"Stocks: %{{x}}%<br>{metric_label}: %{{y:,.2f}}<extra></extra>",
+        )
+    )
+
+    fig.add_vline(
+        x=current_allocation,
+        line_width=1,
+        line_dash="dash",
+        line_color="firebrick",
+        annotation_text="Current allocation",
+        annotation_position="top",
+    )
+
+    fig.update_layout(
+        height=350,
+        margin=dict(l=40, r=40, t=30, b=40),
+        xaxis=dict(title="Stock allocation [%]", range=[0, 100]),
+        yaxis=dict(title=metric_label),
+        showlegend=False,
     )
 
     return fig
