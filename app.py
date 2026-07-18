@@ -15,6 +15,7 @@ from functions import (
     sweep_allocation,
     plot_allocation_sweep,
     build_life_cashflow_schedule,
+    build_two_phase_allocation,
     ever_depleted,
     GERMAN_TAX_FREE_ALLOWANCE,
     GERMAN_SOLI_RATE,
@@ -118,14 +119,64 @@ def build_pdf_report(res, fig, param_lines, title="FrontPointFinance Monte Carlo
     return bytes(pdf.output())
 
 
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", page_title="FrontPointFinance")
 
-st.title("📈 FrontPointFinance Monte Carlo")
+st.title("📈 FrontPointFinance")
+st.caption("A Monte Carlo simulator for your investment and retirement plan.")
 
 MODE_MANUAL = "Manual"
 MODE_SAVINGS_GOAL = "Solve required savings (accumulation goal)"
 MODE_WITHDRAWAL_GOAL = "Solve max withdrawal (decumulation goal)"
 MODE_LIFE = "Full life simulation (accumulation + Rente-supported decumulation)"
+
+# Short, CSS-safe ids for the mode cards below (the MODE_* constants above
+# contain spaces/parens and can't be used directly as container keys).
+_MODE_CARD_ID = {
+    MODE_MANUAL: "manual",
+    MODE_SAVINGS_GOAL: "savings_goal",
+    MODE_WITHDRAWAL_GOAL: "withdrawal_goal",
+    MODE_LIFE: "life",
+}
+MODE_CARDS = [
+    (MODE_MANUAL, "🧮", "Explore a plan", "Pick a savings or spending amount and see what happens."),
+    (MODE_SAVINGS_GOAL, "🎯", "How much must I save?", "Solve for the yearly savings needed to hit a portfolio target."),
+    (MODE_WITHDRAWAL_GOAL, "💸", "How much can I spend?", "Solve for the most you can withdraw each year without running out."),
+    (MODE_LIFE, "🧓", "When can I retire?", "Find the earliest retirement age your savings and pensions can support."),
+]
+
+st.markdown(
+    """
+    <style>
+    .st-key-mode_card_life { border-color: #ff9d45 !important; border-width: 2px !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+if "mode" not in st.session_state:
+    st.session_state.mode = MODE_LIFE
+
+st.write("**What do you want to find out?**")
+mode_cols = st.columns(4)
+for col, (mode_value, emoji, title, desc) in zip(mode_cols, MODE_CARDS):
+    card_id = _MODE_CARD_ID[mode_value]
+    with col:
+        with st.container(key=f"mode_card_{card_id}", border=True):
+            if mode_value == MODE_LIFE:
+                st.caption("⭐ Most popular")
+            st.markdown(f"**{emoji} {title}**")
+            st.caption(desc)
+            is_active = st.session_state.mode == mode_value
+            if st.button(
+                "Selected" if is_active else "Select",
+                key=f"select_{card_id}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.mode = mode_value
+                st.rerun()
+
+mode = st.session_state.mode
 
 with st.expander("📂 Load a saved scenario", expanded=False):
     uploaded_scenario = st.file_uploader("Scenario JSON", type="json", key="scenario_uploader")
@@ -139,202 +190,227 @@ with st.expander("📂 Load a saved scenario", expanded=False):
         st.session_state["_loaded_scenario_file_id"] = uploaded_scenario.file_id
         st.rerun()
 
-mode = st.radio(
-    "Mode",
-    [MODE_MANUAL, MODE_SAVINGS_GOAL, MODE_WITHDRAWAL_GOAL, MODE_LIFE],
-    key="mode",
-)
+st.sidebar.header("Your situation")
 
-st.header("Simulation Parameters")
-
-n = st.slider("Number of simulations", 100, 10000, 1000, 100, key="n")
-start_year = st.slider("Starting year of simulation", 2026, 2100, 2026, 1, key="start_year")
-
-if mode == MODE_LIFE:
-    current_age = st.slider("Current age", 18, 90, 35, 1, key="current_age")
-    plan_until_age = st.slider("Plan until age", current_age + 1, 110, 90, 1, key="plan_until_age")
-    time = plan_until_age - current_age
-    st.caption(f"Horizon derived from ages: {time} years.")
-else:
-    time = st.slider("Run time of simulation [yrs]", 0, 50, 20, 1, key="time")
-
-st.header("Capital & Cashflows")
-
-starting_capital = st.slider("Starting portfolio value [€]", 0, 2_000_000, 10_000, 1000, key="starting_capital")
-
-if mode == MODE_MANUAL:
-    yearly_invest = st.slider("Annual amount saved (+) or withdrawn (-) from the portfolio [€]", -100_000, 100_000, 0, 100, key="yearly_invest")
-
-elif mode == MODE_SAVINGS_GOAL:
-    target_net_worth = st.slider("Target net worth [€]", 0, 5_000_000, 1_000_000, 10_000, key="target_net_worth")
-    target_probability = st.slider("Target probability of reaching it [%]", 1, 99, 90, 1, key="target_probability")
-    with st.expander("Solver settings (advanced)", expanded=False):
-        st.caption(
-            "Each solver iteration re-runs a full batch of simulations, so runtime scales "
-            "with simulations × iterations. The chart below also reuses this same batch "
-            "(not the 'Number of simulations' slider above), so raising it improves both "
-            "the solved value's accuracy and the chart's resolution."
-        )
-        solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="solver_n")
-        solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="solver_max_iter")
-
-elif mode == MODE_WITHDRAWAL_GOAL:
-    max_bankruptcy_probability = st.slider("Acceptable bankruptcy probability by end of horizon [%]", 1, 50, 5, 1, key="max_bankruptcy_probability")
-    with st.expander("Solver settings (advanced)", expanded=False):
-        st.caption(
-            "Each solver iteration re-runs a full batch of simulations, so runtime scales "
-            "with simulations × iterations. The chart below also reuses this same batch "
-            "(not the 'Number of simulations' slider above), so raising it improves both "
-            "the solved value's accuracy and the chart's resolution."
-        )
-        solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="solver_n")
-        solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="solver_max_iter")
-
-else:  # MODE_LIFE
-    retirement_mode = st.radio(
-        "Retirement age",
-        ["Set manually", "Solve for earliest (target success probability)"],
-        horizontal=True,
-        key="retirement_mode",
-    )
-
-    if retirement_mode == "Set manually":
-        retirement_age = st.slider(
-            "Retirement age (stop working & contributing)",
-            current_age + 1, plan_until_age, min(65, plan_until_age), 1,
-            key="retirement_age",
-        )
-        pension_age_lower_bound = retirement_age
+with st.sidebar:
+    if mode == MODE_LIFE:
+        current_age = st.slider("Current age", 18, 90, 30, 1, key="current_age")
+        plan_until_age = st.slider("Plan until age", current_age + 1, 110, 95, 1, key="plan_until_age")
+        time = plan_until_age - current_age
+        st.caption(f"Horizon derived from ages: {time} years.")
     else:
-        target_retirement_probability = st.slider(
-            "Target probability of never depleting the portfolio [%]", 1, 99, 90, 1,
-            key="target_retirement_probability",
-        )
-        with st.expander("Solver settings (advanced)", expanded=False):
+        time = st.slider("How many years to simulate", 0, 50, 20, 1, key="time")
+
+    starting_capital = st.slider("How much do you have invested today? [€]", 0, 2_000_000, 10_000, 1000, key="starting_capital")
+
+    st.divider()
+
+    if mode == MODE_MANUAL:
+        yearly_invest = st.slider("Yearly amount you save (+) or withdraw (–) [€]", -100_000, 100_000, 0, 100, key="yearly_invest")
+
+    elif mode == MODE_SAVINGS_GOAL:
+        target_net_worth = st.slider("Target portfolio value [€]", 0, 5_000_000, 1_000_000, 10_000, key="target_net_worth")
+        target_probability = st.slider("How confident do you want to be? [%]", 1, 99, 90, 1, key="target_probability")
+        with st.expander("🎯 Solver precision (expert)", expanded=False):
             st.caption(
                 "Each solver iteration re-runs a full batch of simulations, so runtime scales "
                 "with simulations × iterations. The chart below also reuses this same batch "
-                "(not the 'Number of simulations' slider above), so raising it improves both "
+                "(not the simulation count in Expert settings), so raising it improves both "
                 "the solved value's accuracy and the chart's resolution."
             )
-            solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="retire_solver_n")
-            solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="retire_solver_max_iter")
-        pension_age_lower_bound = current_age
+            solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="solver_n")
+            solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="solver_max_iter")
 
-    accumulation_savings = st.slider("Annual savings while working [€, today's money]", 0, 200_000, 15_000, 500, key="accumulation_savings")
-    retirement_spending = st.slider("Desired annual retirement spending [€, today's money]", 0, 200_000, 30_000, 500, key="retirement_spending")
+    elif mode == MODE_WITHDRAWAL_GOAL:
+        max_bankruptcy_probability = st.slider("Acceptable risk of running out of money [%]", 1, 50, 5, 1, key="max_bankruptcy_probability")
+        with st.expander("🎯 Solver precision (expert)", expanded=False):
+            st.caption(
+                "Each solver iteration re-runs a full batch of simulations, so runtime scales "
+                "with simulations × iterations. The chart below also reuses this same batch "
+                "(not the simulation count in Expert settings), so raising it improves both "
+                "the solved value's accuracy and the chart's resolution."
+            )
+            solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="solver_n")
+            solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="solver_max_iter")
 
-    col_g, col_b = st.columns(2)
-    with col_g:
-        st.markdown("**Gesetzliche Rente**")
-        gesetzliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 18_000, 500, key="gesetzliche_amount")
-        gesetzliche_rente_age = st.slider(
-            "Start age", pension_age_lower_bound, plan_until_age,
-            min(max(67, pension_age_lower_bound), plan_until_age), 1, key="gesetzliche_age",
+    else:  # MODE_LIFE
+        retirement_mode = st.radio(
+            "Retirement age",
+            ["Set manually", "Find earliest possible age"],
+            horizontal=True,
+            key="retirement_mode",
         )
-    with col_b:
-        st.markdown("**Betriebliche Rente**")
-        betriebliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 0, 500, key="betriebliche_amount")
-        betriebliche_rente_age = st.slider(
-            "Start age", pension_age_lower_bound, plan_until_age,
-            min(max(65, pension_age_lower_bound), plan_until_age), 1, key="betriebliche_age",
-        )
 
-    st.markdown("**One-off & recurring events** (e.g. house purchase, inheritance, car)")
+        if retirement_mode == "Set manually":
+            retirement_age = st.slider(
+                "Retirement age (stop working & contributing)",
+                current_age + 1, plan_until_age, min(65, plan_until_age), 1,
+                key="retirement_age",
+            )
+            pension_age_lower_bound = retirement_age
+        else:
+            target_retirement_probability = st.slider(
+                "How confident do you want to be that you never run out? [%]", 1, 99, 95, 1,
+                key="target_retirement_probability",
+            )
+            with st.expander("🎯 Solver precision (expert)", expanded=False):
+                st.caption(
+                    "Each solver iteration re-runs a full batch of simulations, so runtime scales "
+                    "with simulations × iterations. The chart below also reuses this same batch "
+                    "(not the simulation count in Expert settings), so raising it improves both "
+                    "the solved value's accuracy and the chart's resolution."
+                )
+                solver_n = st.slider("Simulations per solver iteration", 50, 2000, 300, 50, key="retire_solver_n")
+                solver_max_iter = st.slider("Max solver iterations", 5, 60, 25, 5, key="retire_solver_max_iter")
+            pension_age_lower_bound = current_age
 
-    if "life_events_list" not in st.session_state:
-        st.session_state.life_events_list = []
+        accumulation_savings = st.slider("Annual savings while working [€, today's money]", 0, 200_000, 15_000, 500, key="accumulation_savings")
+        retirement_spending = st.slider("Desired annual retirement spending [€, today's money]", 0, 200_000, 30_000, 500, key="retirement_spending")
 
-    add_col1, add_col2, add_col3 = st.columns([1, 1.6, 1])
-    with add_col1:
+        col_g, col_b = st.columns(2)
+        with col_g:
+            st.markdown("**Gesetzliche Rente**", help="Germany's state pension")
+            gesetzliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 18_000, 500, key="gesetzliche_amount")
+            gesetzliche_rente_age = st.slider(
+                "Start age", pension_age_lower_bound, plan_until_age,
+                min(max(67, pension_age_lower_bound), plan_until_age), 1, key="gesetzliche_age",
+            )
+        with col_b:
+            st.markdown("**Betriebliche Rente**", help="Employer-provided occupational pension")
+            betriebliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 0, 500, key="betriebliche_amount")
+            betriebliche_rente_age = st.slider(
+                "Start age", pension_age_lower_bound, plan_until_age,
+                min(max(65, pension_age_lower_bound), plan_until_age), 1, key="betriebliche_age",
+            )
+
+        st.markdown("**One-off & recurring events** (e.g. house purchase, inheritance, car)")
+
+        if "life_events_list" not in st.session_state:
+            st.session_state.life_events_list = []
+
         new_event_age = st.number_input(
             "At age", min_value=current_age, max_value=plan_until_age,
             value=current_age, step=1, key="new_event_age",
         )
-    with add_col2:
-        new_event_amount = st.number_input(
-            "Amount [€, today's money]", value=0.0, step=500.0, key="new_event_amount",
-            help="Positive = inflow/windfall, negative = expense",
-        )
-    with add_col3:
         new_event_recurring = st.checkbox("Recurring", key="new_event_recurring")
+        new_event_amount = st.number_input(
+            "Amount [€, today's money]" if new_event_recurring else "Amount [€, exact amount that year]",
+            value=0.0, step=500.0, key="new_event_amount",
+            help=(
+                "Positive = inflow/windfall, negative = expense. "
+                + (
+                    "Scales with inflation each time it recurs, like your savings/spending."
+                    if new_event_recurring
+                    else "Paid out exactly as entered — not scaled up by inflation, so a "
+                         "400k inheritance is 400k whichever year it lands in."
+                )
+            ),
+        )
 
-    if new_event_recurring:
-        rec_col1, rec_col2 = st.columns(2)
-        with rec_col1:
+        if new_event_recurring:
             new_event_repeat = st.number_input(
                 "Every N years", min_value=1, value=5, step=1, key="new_event_repeat",
             )
-        with rec_col2:
             new_event_until = st.number_input(
                 "Until age (0 = plan end)", min_value=0, max_value=plan_until_age,
                 value=0, step=1, key="new_event_until",
             )
+        else:
+            new_event_repeat, new_event_until = 0, 0
+
+        if st.button("➕ Add event"):
+            st.session_state.life_events_list.append({
+                "age": new_event_age,
+                "amount": float(new_event_amount),
+                "repeat_every": new_event_repeat if new_event_recurring else 0,
+                "until_age": new_event_until if (new_event_recurring and new_event_until > 0) else None,
+            })
+            st.rerun()
+
+        for i, ev in enumerate(st.session_state.life_events_list):
+            row_col1, row_col2 = st.columns([6, 1])
+            with row_col1:
+                st.write(format_one_life_event(ev))
+            with row_col2:
+                if st.button("✕", key=f"remove_event_{i}"):
+                    st.session_state.life_events_list.pop(i)
+                    st.rerun()
+
+    st.divider()
+    asset_allocation = st.slider("Stocks vs. bonds — % in stocks", 0, 100, 100, 1, key="asset_allocation")
+
+    if mode == MODE_LIFE:
+        shift_allocation_at_retirement = st.checkbox(
+            "Shift to a different mix at retirement?", value=False,
+            key="shift_allocation_at_retirement",
+            help=(
+                "De-risks in one step at retirement: the overweight sleeve is "
+                "sold (realizing gains and paying tax) to buy the underweight "
+                "one, then the new mix is held — not a continuous year-by-year "
+                "glide."
+            ),
+        )
+        if shift_allocation_at_retirement:
+            retirement_stock_alloc = st.slider(
+                "Stock allocation from retirement onward [%]", 0, 100, 100, 1,
+                key="retirement_stock_alloc",
+            )
+        else:
+            retirement_stock_alloc = None
     else:
-        new_event_repeat, new_event_until = 0, 0
+        retirement_stock_alloc = None
 
-    if st.button("➕ Add event"):
-        st.session_state.life_events_list.append({
-            "age": new_event_age,
-            "amount": float(new_event_amount),
-            "repeat_every": new_event_repeat if new_event_recurring else 0,
-            "until_age": new_event_until if (new_event_recurring and new_event_until > 0) else None,
-        })
-        st.rerun()
+    with st.expander("⚙️ Advanced: returns, costs & inflation", expanded=False):
+        inflation_value = st.slider("Expected inflation [%/yr]", 0.0, 10.0, 2.0, 0.1, key="inflation_value")
+        start_year = st.slider("Simulation start year", 2026, 2100, 2026, 1, key="start_year")
 
-    for i, ev in enumerate(st.session_state.life_events_list):
-        row_col1, row_col2 = st.columns([6, 1])
-        with row_col1:
-            st.write(format_one_life_event(ev))
-        with row_col2:
-            if st.button("✕", key=f"remove_event_{i}"):
-                st.session_state.life_events_list.pop(i)
-                st.rerun()
+        st.markdown("**Stocks**")
+        st.caption("Default values for A1JX52")
+        average_annual_return = st.slider("Expected average annual return [%]", 0.0, 20.0, 8.0, 0.1, key="average_annual_return")
+        std_on_return = st.slider("Volatility (return std. dev.) [%]", 0.0, 30.0, 16.0, 0.1, key="std_on_return")
+        ter = st.slider("Fund fee (TER) [%]", 0.0, 2.0, 0.2, 0.1, key="ter")
+        dividend = st.slider("Dividend yield [%]", 0.0, 3.0, 1.4, 0.1, key="dividend")
 
-inflation_value = st.slider("Inflation-rate to modify yearly cashflow [%]", 0.0, 10.0, 2.0, 0.1, key="inflation_value")
-tax = st.slider("Capital gain tax [%]", 0, 40, 25, 1, key="tax")
-_effective_tax = tax * (1 + GERMAN_SOLI_RATE)
-_effective_tax_equity = _effective_tax * (1 - GERMAN_TEILFREISTELLUNG_EQUITY)
-st.caption(
-    f"Base rate — the {GERMAN_SOLI_RATE*100:.1f}% Solidaritätszuschlag is added automatically "
-    f"({_effective_tax:.3f}% effective), and equity-fund gains/dividends additionally get the "
-    f"{GERMAN_TEILFREISTELLUNG_EQUITY*100:.0f}% Teilfreistellung exemption "
-    f"({_effective_tax_equity:.2f}% effective on stock gains; the fixed-income holding doesn't qualify)."
-)
-tax_free_allowance = st.slider(
-    "Tax-free allowance on dividends & realized gains (Sparer-Pauschbetrag) [€/yr]",
-    0, 2000, GERMAN_TAX_FREE_ALLOWANCE, 100, key="tax_free_allowance",
-)
+        st.markdown("**Bonds / fixed income**")
+        st.caption("Default values for DBX0AN")
+        average_annual_return_fi = st.slider("Expected average annual return [%]", 0.0, 5.0, 2.0, 0.1, key="average_annual_return_fi")
+        std_on_return_fi = st.slider("Volatility (return std. dev.) [%]", 0.0, 1.0, 0.2, 0.1, key="std_on_return_fi")
+        ter_fi = st.slider("Fund fee (TER) [%]", 0.0, 1.0, 0.1, 0.05, key="ter_fi")
 
-st.header("Stock Allocation")
-st.write("<small style='color:gray'>Default values for A1JX52</small>", unsafe_allow_html=True)
+        st.markdown("**Rebalancing & crashes**")
+        rebalance = st.checkbox("Rebalance", True, key="rebalance")
+        rebalance_threshold = st.slider("...via savings/withdrawals if allocation is off more than [%]", 0, 15, 5, 1, key="rebalance_threshold")
+        crash = st.checkbox("Include random market crashes?", True, key="crash")
+        crash_prob = st.slider("Crash probability per year [%]", 1, 10, 3, 1, key="crash_prob", help="A crash year samples a one-year loss between -20% and -50%.")
 
-asset_allocation = st.slider("Share of stocks [%]", 0, 100, 100, 1, key="asset_allocation")
-rebalance = st.checkbox("Rebalance", True, key="rebalance")
-rebalance_threshold = st.slider("via savings / withdrawals if allocation is off more than ... [%]", 0, 15, 5, 1, key="rebalance_threshold")
-pdf = st.selectbox("Probability density function of annual price returns", ["studentt", "gaussian"], key="pdf")
-average_annual_return = st.slider("Average annual arithmetic returns [%]", 0.0, 20.0, 8.0, 0.1, key="average_annual_return")
-std_on_return = st.slider("Standard deviation on price returns [%]", 0.0, 30.0, 16.0, 0.1, key="std_on_return")
-ter = st.slider("TER [%]", 0.0, 2.0, 0.2, 0.1, key="ter")
-dividend = st.slider("Rate of annual dividend payout [%]", 0.0, 3.0, 1.4, 0.1, key="dividend")
-
-st.header("Fixed Income Allocation")
-st.write("<small style='color:gray'>Default values for DBX0AN</small>", unsafe_allow_html=True)
-
-average_annual_return_fi = st.slider("Average annual total returns [%]", 0.0, 5.0, 2.0, 0.1, key="average_annual_return_fi")
-std_on_return_fi = st.slider("Standard deviation on price returns [%]", 0.0, 1.0, 0.2, 0.1, key="std_on_return_fi")
-ter_fi = st.slider("TER [%]", 0.0, 1.0, 0.1, 0.05, key="ter_fi")
-
-st.header("Crash Settings")
-crash = st.checkbox("Enable crash", False, key="crash")
-crash_prob = st.slider("Probability of a crash (sampled from -20% to -50%) occurring in a given year [%]", 1, 10, 3, 1, key="crash_prob")
+    with st.expander("🔬 Expert: tax details & simulation internals", expanded=False):
+        n = st.slider("Number of simulations", 100, 10000, 1000, 100, key="n", help="More simulations = smoother percentiles but slower runs.")
+        pdf = st.selectbox("Return distribution model", ["studentt", "gaussian"], key="pdf", help="'studentt' has fatter tails (more extreme years) than a plain 'gaussian' bell curve.")
+        tax = st.slider("Capital gains tax rate [%]", 0, 40, 25, 1, key="tax")
+        _effective_tax = tax * (1 + GERMAN_SOLI_RATE)
+        _effective_tax_equity = _effective_tax * (1 - GERMAN_TEILFREISTELLUNG_EQUITY)
+        st.caption(
+            f"Base rate — the {GERMAN_SOLI_RATE*100:.1f}% Solidaritätszuschlag is added automatically "
+            f"({_effective_tax:.3f}% effective), and equity-fund gains/dividends additionally get the "
+            f"{GERMAN_TEILFREISTELLUNG_EQUITY*100:.0f}% Teilfreistellung exemption "
+            f"({_effective_tax_equity:.2f}% effective on stock gains; the fixed-income holding doesn't qualify)."
+        )
+        tax_free_allowance = st.slider(
+            "Tax-free allowance on gains (Sparer-Pauschbetrag) [€/yr]",
+            0, 2000, GERMAN_TAX_FREE_ALLOWANCE, 100, key="tax_free_allowance",
+        )
 
 st.markdown(
     """
     <style>
+    .st-key-main_action_button .stElementContainer,
+    .st-key-main_action_button .stButton {
+        width: 100% !important;
+    }
     .st-key-main_action_button button {
-        width: 1310px;
-        height: 80px;
+        width: 100% !important;
+        height: 80px !important;
+        font-size: 1.3rem !important;
     }
     </style>
     """,
@@ -504,6 +580,7 @@ if run_clicked:
                 tax=tax,
                 tax_free_allowance=tax_free_allowance,
                 asset_allocation=asset_allocation,
+                retirement_stock_alloc=retirement_stock_alloc,
                 rebalance=rebalance,
                 rebalance_threshold=rebalance_threshold,
                 pdf=pdf,
@@ -546,6 +623,17 @@ if run_clicked:
             events=life_events,
         )
 
+        # retirement_stock_alloc is None unless the "Shift to a different mix
+        # at retirement?" checkbox is on, in which case this builds the
+        # two-phase schedule around the now-fixed retirement_age.
+        allocation_schedule = (
+            build_two_phase_allocation(
+                time, retirement_age - current_age,
+                0.01 * asset_allocation, 0.01 * retirement_stock_alloc,
+            )
+            if retirement_stock_alloc is not None else None
+        )
+
         if life_solving_retirement:
             # Reuse the solver's own converged batch for the chart (n=1 just to get
             # the deterministic baselines), so the plotted percentiles always agree
@@ -556,6 +644,7 @@ if run_clicked:
                 start_year=start_year,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
+                allocation_schedule=allocation_schedule,
                 **shared_kwargs,
             )
         else:
@@ -564,6 +653,7 @@ if run_clicked:
                 start_year=start_year,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
+                allocation_schedule=allocation_schedule,
                 progress_callback=update_progress,
                 **shared_kwargs,
             )
@@ -588,6 +678,8 @@ if run_clicked:
             "betriebliche_rente_age": betriebliche_rente_age,
             "life_events": life_events,
             "life_events_list": list(st.session_state.life_events_list),
+            "asset_allocation": asset_allocation,
+            "retirement_stock_alloc": retirement_stock_alloc,
             "retirement_solved": life_solving_retirement,
             "target_retirement_probability": target_retirement_probability if life_solving_retirement else None,
             "achieved_retirement_probability": achieved_prob,
@@ -603,7 +695,12 @@ if run_clicked:
 if st.session_state.results is not None:
     res = st.session_state.results
 
-    if res["mode"] == "savings_goal":
+    if res["mode"] == "manual":
+        verb = "saving" if res["yearly_invest"] >= 0 else "withdrawing"
+        st.success(
+            f"Simulated **{verb} {abs(res['yearly_invest']):,.0f} €/yr** for **{res['time']} years**."
+        )
+    elif res["mode"] == "savings_goal":
         st.success(
             f"Required yearly savings: **{res['yearly_invest']:,.0f} €** to reach "
             f"**{res['target_net_worth']:,.0f} €** with **{res['achieved_probability']*100:.1f}%** "
@@ -622,6 +719,13 @@ if st.session_state.results is not None:
         if res["betriebliche_rente"] > 0:
             pension_bits.append(f"betriebliche Rente ({res['betriebliche_rente']:,.0f} €/yr) from age {res['betriebliche_rente_age']}")
         pension_text = " and ".join(pension_bits) if pension_bits else "no pension income"
+        if res.get("retirement_stock_alloc") is not None:
+            allocation_text = (
+                f" Stock allocation shifts from {res['asset_allocation']:.0f}% to "
+                f"{res['retirement_stock_alloc']:.0f}% at retirement."
+            )
+        else:
+            allocation_text = ""
         if res["retirement_solved"]:
             st.success(
                 f"Earliest retirement age: **{res['retirement_age']}** gives a "
@@ -629,12 +733,30 @@ if st.session_state.results is not None:
                 f"depleting the portfolio (target was {res['target_retirement_probability']}%). "
                 f"Saving **{res['accumulation_savings']:,.0f} €/yr** until then, then spending "
                 f"**{res['retirement_spending']:,.0f} €/yr** (today's money), offset by {pension_text}."
+                f"{allocation_text}"
             )
         else:
             st.success(
                 f"Saving **{res['accumulation_savings']:,.0f} €/yr** until age {res['retirement_age']}, then "
                 f"spending **{res['retirement_spending']:,.0f} €/yr** (today's money), offset by {pension_text}."
+                f"{allocation_text}"
             )
+
+    final_values = np.array([r[-1] for r in res["runs"]])
+    worst_case, typical_case, best_case = np.percentile(final_values, [10, 50, 90])
+    risk_of_running_out = np.mean(ever_depleted(res["runs"])) * 100
+    if risk_of_running_out < 5:
+        risk_badge = "🟢 Low"
+    elif risk_of_running_out < 20:
+        risk_badge = "🟡 Moderate"
+    else:
+        risk_badge = "🔴 High"
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Worst case (bottom 10%)", f"{worst_case:,.0f} €")
+    metric_cols[1].metric("Typical outcome (median)", f"{typical_case:,.0f} €")
+    metric_cols[2].metric("Best case (top 10%)", f"{best_case:,.0f} €")
+    metric_cols[3].metric("Chance you run out of money", f"{risk_of_running_out:.1f}%", delta=risk_badge, delta_color="off")
 
     col1, col2, col3 = st.columns([0.75, 11.5, 5])  # center col2
 
@@ -701,7 +823,10 @@ if st.session_state.results is not None:
     st.caption(
         "Holds the savings/withdrawal plan behind the result above fixed and "
         "varies the stock/bond mix, using the same simulated return paths at "
-        "every point so the curve reflects allocation, not fresh Monte Carlo noise."
+        "every point so the curve reflects allocation, not fresh Monte Carlo noise. "
+        "Shows the median final portfolio value plus the 10th-90th percentile "
+        "range, so you can see a higher stock share raise the typical outcome "
+        "while also widening the downside — not just the median."
     )
 
     with st.expander("Sweep settings (advanced)", expanded=False):
@@ -743,21 +868,19 @@ if st.session_state.results is not None:
         sweep_progress.progress(1.0)
 
         if res["mode"] == "manual":
-            def metric_fn(runs):
-                return float(np.median([r[-1] for r in runs]))
-            metric_label = "Median final value [€]"
+            goal_metric_fn, goal_metric_label = None, None
         elif res["mode"] == "savings_goal":
             target = res["target_net_worth"]
-            def metric_fn(runs):
+            def goal_metric_fn(runs):
                 return float(np.mean(np.array([r[-1] for r in runs]) >= target)) * 100
-            metric_label = "Chance of reaching target [%]"
+            goal_metric_label = "Chance of reaching target [%]"
         else:  # withdrawal_goal or life
-            def metric_fn(runs):
+            def goal_metric_fn(runs):
                 return float(np.mean(~ever_depleted(runs))) * 100
-            metric_label = "Chance of never depleting the portfolio [%]"
+            goal_metric_label = "Chance of never depleting the portfolio [%]"
 
         st.session_state.sweep_fig = plot_allocation_sweep(
-            alloc_results, metric_fn, metric_label, current_allocation
+            alloc_results, current_allocation, goal_metric_fn, goal_metric_label
         )
 
     if st.session_state.get("sweep_fig") is not None:
@@ -773,6 +896,11 @@ if st.session_state.results is not None:
             f"Betriebliche Rente: {res['betriebliche_rente']:,.0f} €/yr from age {res['betriebliche_rente_age']}\n"
             f"Retirement age: {res['retirement_age']}"
         )
+        if res.get("retirement_stock_alloc") is not None:
+            cashflow_lines += (
+                f"\nStock allocation shifts to {res['retirement_stock_alloc']:.0f}% at retirement "
+                f"(was {res['asset_allocation']:.0f}%)"
+            )
         events_text = format_life_events(res["life_events_list"])
         if events_text:
             cashflow_lines += f"\nEvents:\n{events_text}"
@@ -859,6 +987,9 @@ if st.session_state.results is not None:
             scenario_params["retire_solver_n"] = solver_n
             scenario_params["retire_solver_max_iter"] = solver_max_iter
         scenario_params["events"] = list(st.session_state.life_events_list)
+        scenario_params["shift_allocation_at_retirement"] = shift_allocation_at_retirement
+        if retirement_stock_alloc is not None:
+            scenario_params["retirement_stock_alloc"] = retirement_stock_alloc
 
     if st.button("💾 Prepare scenario export (JSON)"):
         st.session_state.scenario_export = json.dumps(scenario_params, indent=2)

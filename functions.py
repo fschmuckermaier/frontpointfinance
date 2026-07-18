@@ -126,6 +126,82 @@ def _sell_lots_fifo(lots, target_net, remaining_allowance, tax_pct, teilfreistel
 
     return net_raised, remaining_allowance
 
+
+def _sell_gross_fifo(lots, gross_target, remaining_allowance, tax_pct, teilfreistellung_rate=0.0):
+    """
+    Sell `gross_target` euros of current market value from FIFO purchase lots
+    (oldest first), realizing gains and paying tax the same way as
+    _sell_lots_fifo — but parameterized by the *gross* amount removed from the
+    sleeve rather than the net cash raised. Used by _rebalance_to_target, where
+    we want to shed a known slice of the overweight asset (its tax leaks out of
+    the portfolio as drag). Mutates `lots`. Returns (net_proceeds, remaining_allowance).
+    """
+    eps = 1e-9
+    tax_rate = 0.01 * tax_pct
+    gross_sold = 0.0
+    net_proceeds = 0.0
+
+    while lots and gross_sold < gross_target - eps:
+        lot = lots[0]
+        value, cost = lot["value"], lot["cost"]
+        if value <= eps:
+            lots.pop(0)
+            continue
+
+        take = min(value, gross_target - gross_sold)
+        frac = take / value
+        cost_sold = cost * frac
+        gain = max(0.0, take - cost_sold)
+        taxable_gain_gross = gain * (1 - teilfreistellung_rate)
+        taxable_gain = max(0.0, taxable_gain_gross - remaining_allowance)
+        tax_amount = taxable_gain * tax_rate
+
+        remaining_allowance = max(0.0, remaining_allowance - taxable_gain_gross)
+        lot["value"] -= take
+        lot["cost"] -= cost_sold
+        if lot["value"] <= eps:
+            lots.pop(0)
+
+        gross_sold += take
+        net_proceeds += take - tax_amount
+
+    return net_proceeds, remaining_allowance
+
+
+def _rebalance_to_target(stock_lots, fi_lots, target_stock_alloc,
+                         remaining_allowance, effective_tax):
+    """
+    Actively rebalance holdings to `target_stock_alloc` (0-1) by selling the
+    overweight sleeve and buying the underweight one with the net proceeds.
+    Selling realizes gains FIFO and pays tax (30% Teilfreistellung on the
+    equity sleeve, none on FI), so the shift costs real money — de-risking is
+    not free, and the tax paid leaks permanently out of the portfolio. Mutates
+    both lot lists in place; returns the updated remaining_allowance.
+    """
+    stock_val = _lots_value(stock_lots)
+    fi_val = _lots_value(fi_lots)
+    total = stock_val + fi_val
+    if total <= 0:
+        return remaining_allowance
+
+    target_stock_val = target_stock_alloc * total
+    if stock_val > target_stock_val:
+        gross = stock_val - target_stock_val
+        net, remaining_allowance = _sell_gross_fifo(
+            stock_lots, gross, remaining_allowance, effective_tax,
+            teilfreistellung_rate=GERMAN_TEILFREISTELLUNG_EQUITY,
+        )
+        _add_lot(fi_lots, net)
+    else:
+        gross = target_stock_val - stock_val
+        net, remaining_allowance = _sell_gross_fifo(
+            fi_lots, gross, remaining_allowance, effective_tax,
+            teilfreistellung_rate=0.0,
+        )
+        _add_lot(stock_lots, net)
+
+    return remaining_allowance
+
 plt.rcParams.update({
     'font.family': 'Arial',   
     'font.size': 12,
@@ -215,6 +291,7 @@ def run_simulation_portfolio(
         tax,
         tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
         cashflow_schedule=None,
+        allocation_schedule=None,
         pdf_stocks="studentt",
         pdf_fi="gaussian",
         crash=False,
@@ -264,6 +341,18 @@ def run_simulation_portfolio(
                 pension starts, withdrawing less after). Build one with
                 build_life_cashflow_schedule(). Values should already include
                 any desired inflation adjustment.
+            allocation_schedule (array-like of float): Optional, length `time`.
+                When given, overrides `target_stock_allocation` per year with a
+                target stock fraction (0-1) that can change over the run (e.g.
+                100% equity while accumulating, then a lower share in
+                retirement — a two-phase glidepath). Whenever the target
+                changes from one year to the next, the portfolio is actively
+                rebalanced to the new target at the start of that year: the
+                overweight sleeve is sold FIFO (realizing gains and paying
+                tax) and the proceeds buy the underweight one, so the shift
+                has a real tax cost. Drift *within* a phase is not force-sold
+                every year — it's left to the cashflow nudging below. Build
+                one with build_two_phase_allocation().
             pdf_stocks (str): PDF type for stock returns.
             crash (bool): Enable crash simulation.
             crash_prob (float): Annual crash probability (%).
@@ -272,11 +361,16 @@ def run_simulation_portfolio(
             portfolio_values (list): Total portfolio value each year (length time+1).
         """
 
+        initial_alloc = (
+            allocation_schedule[0] if allocation_schedule is not None
+            else target_stock_allocation
+        )
+
         # Initial purchase lots (cost basis = value at simulation start):
         stock_lots = []
         fi_lots = []
-        _add_lot(stock_lots, starting_capital * target_stock_allocation)
-        _add_lot(fi_lots, starting_capital * (1 - target_stock_allocation))
+        _add_lot(stock_lots, starting_capital * initial_alloc)
+        _add_lot(fi_lots, starting_capital * (1 - initial_alloc))
 
         effective_tax = tax * (1 + GERMAN_SOLI_RATE)  # bakes in Soli; see docstring
 
@@ -284,6 +378,7 @@ def run_simulation_portfolio(
 
         inflation_rate = inflation_value
         infl_adj_yearly_invest = yearly_invest
+        prev_target = initial_alloc
 
 
         effective_threshold = 0.01 * rebalance_threshold if rebalance else 1.0
@@ -293,7 +388,23 @@ def run_simulation_portfolio(
             if cashflow_schedule is not None:
                 infl_adj_yearly_invest = cashflow_schedule[year]
 
+            current_target = (
+                allocation_schedule[year] if allocation_schedule is not None
+                else target_stock_allocation
+            )
+
             remaining_allowance = tax_free_allowance
+
+            # --- Active rebalance on a target change (glidepath transition) ---
+            # Fires only when this year's target differs from last year's, e.g.
+            # de-risking at retirement. Sells the overweight sleeve (realizing
+            # gains + tax) to buy the underweight one, before this year's
+            # returns and cashflow, so the year is lived at the new allocation.
+            if allocation_schedule is not None and abs(current_target - prev_target) > 1e-9:
+                remaining_allowance = _rebalance_to_target(
+                    stock_lots, fi_lots, current_target, remaining_allowance, effective_tax
+                )
+            prev_target = current_target
 
             # --- Stocks ---
 
@@ -338,12 +449,12 @@ def run_simulation_portfolio(
 
             # Calculate current allocation
             total_capital = capital_stocks + capital_fi
-            current_stock_alloc = capital_stocks / total_capital if total_capital > 0 else target_stock_allocation
-            current_fi_alloc = capital_fi / total_capital if total_capital > 0 else 1 - target_stock_allocation
+            current_stock_alloc = capital_stocks / total_capital if total_capital > 0 else current_target
+            current_fi_alloc = capital_fi / total_capital if total_capital > 0 else 1 - current_target
 
             # Calculate deviations from target allocation
-            diff_stock = target_stock_allocation - current_stock_alloc
-            diff_fi = (1 - target_stock_allocation) - current_fi_alloc
+            diff_stock = current_target - current_stock_alloc
+            diff_fi = (1 - current_target) - current_fi_alloc
 
 
             # --- Apply dividends and yearly cashflows ---
@@ -367,8 +478,8 @@ def run_simulation_portfolio(
                     invest_fi = infl_adj_yearly_invest
                 else:
                     # Neither underweight beyond threshold: invest by target allocation
-                    invest_stock = infl_adj_yearly_invest * target_stock_allocation
-                    invest_fi = infl_adj_yearly_invest * (1 - target_stock_allocation)
+                    invest_stock = infl_adj_yearly_invest * current_target
+                    invest_fi = infl_adj_yearly_invest * (1 - current_target)
 
                 # Add infl_adj yearly invest split by target allocation
                 _add_lot(stock_lots, invest_stock)
@@ -397,8 +508,8 @@ def run_simulation_portfolio(
 
                 else:
                     # Neither overweight beyond threshold: withdraw by target allocation
-                    withdraw_stock = withdrawal * target_stock_allocation
-                    withdraw_fi = withdrawal * (1 - target_stock_allocation)
+                    withdraw_stock = withdrawal * current_target
+                    withdraw_fi = withdrawal * (1 - current_target)
 
                 # Stocks: dividends (already taxed above) cover the withdrawal first,
                 # any remainder is sold FIFO and only the realized gain is taxed.
@@ -459,6 +570,7 @@ def run_simulations(n=1000,
                     tax=25,
                     tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
                     cashflow_schedule=None,
+                    allocation_schedule=None,
                     asset_allocation=70,
                     rebalance=True,
                     rebalance_threshold=5,
@@ -538,6 +650,7 @@ def run_simulations(n=1000,
         tax=tax,
         tax_free_allowance=tax_free_allowance,
         cashflow_schedule=cashflow_schedule,
+        allocation_schedule=allocation_schedule,
         pdf_stocks=pdf,
         pdf_fi="gaussian",
         crash=False,
@@ -563,6 +676,7 @@ def run_simulations(n=1000,
         tax=tax,
         tax_free_allowance=tax_free_allowance,
         cashflow_schedule=cashflow_schedule,
+        allocation_schedule=allocation_schedule,
         pdf_stocks="gaussian",
         pdf_fi="gaussian",
         crash=False,
@@ -595,6 +709,7 @@ def run_simulations(n=1000,
             tax=tax,
             tax_free_allowance=tax_free_allowance,
             cashflow_schedule=cashflow_schedule,
+            allocation_schedule=allocation_schedule,
             pdf_stocks=pdf,
             pdf_fi="gaussian",
             crash=crash,
@@ -648,6 +763,26 @@ def sweep_allocation(allocations, n, seeds=None, progress_callback=None, **kwarg
     return results
 
 
+def build_two_phase_allocation(time, retirement_year, accumulation_stock_alloc,
+                               retirement_stock_alloc):
+    """
+    Length-`time` array of target stock fractions (0-1) for a two-phase
+    glidepath: `accumulation_stock_alloc` for the working years (year <
+    retirement_year) and `retirement_stock_alloc` from retirement onward.
+
+    Feed the result to run_simulations(allocation_schedule=...). The single
+    step down at retirement_year triggers one active rebalance there (see
+    run_simulation_portfolio), modelling a deliberate one-time de-risking with
+    its real tax cost, rather than a continuous year-by-year glide.
+    """
+    years = np.arange(int(time))
+    return np.where(
+        years < retirement_year,
+        float(accumulation_stock_alloc),
+        float(retirement_stock_alloc),
+    )
+
+
 def build_life_cashflow_schedule(
         time,
         inflation_value,
@@ -675,21 +810,35 @@ def build_life_cashflow_schedule(
 
     Every component compounds with inflation from year 0 the same way a
     single constant yearly_invest already does elsewhere in this module —
-    a pension quoted "starting at 67" and a spending need quoted "from day
-    one" both scale by (1+inflation)^year, so no separate date-shifting is
-    needed beyond an on/off flag per year.
+    a spending need quoted "from day one" scales by (1+inflation)^year, so
+    no separate date-shifting is needed beyond an on/off flag per year.
+    gesetzliche Rente follows the same rule (a defensible simplification:
+    real-world Rentenanpassung tracks wage growth, which roughly keeps pace
+    with inflation long-run). betriebliche Rente instead has its nominal
+    value frozen at whatever it computes to in the year it actually starts,
+    then held flat — matching how most occupational pensions behave in
+    practice (§16 BetrAVG only requires the employer to *review* increases
+    every 3 years, not guarantee them; many are paid as fixed annuities).
 
     Parameters:
         events (iterable of (year_offset, amount, repeat_every, until_year)):
             Optional one-off or recurring lumpy cashflows (house purchase,
-            inheritance, car replacement, ...), each in today's euros and
-            given as a year-offset from year 0 (like every other time
-            argument here, not an age — convert age - current_age before
-            calling). amount > 0 is an inflow, < 0 an expense.
-            repeat_every: 0/None for a one-time event, otherwise the event
-            recurs every `repeat_every` years starting at `year_offset` up
-            to (but not including) `until_year` (defaults to `time` if
-            None). Events falling outside [0, time) are ignored.
+            inheritance, car replacement, ...), given as a year-offset from
+            year 0 (like every other time argument here, not an age —
+            convert age - current_age before calling). amount > 0 is an
+            inflow, < 0 an expense. repeat_every: 0/None for a one-time
+            event, otherwise the event recurs every `repeat_every` years
+            starting at `year_offset` up to (but not including)
+            `until_year` (defaults to `time` if None). Events falling
+            outside [0, time) are ignored.
+
+            One-time events (repeat_every falsy) are taken as the exact
+            nominal amount for that year — entering a 400k inheritance
+            always means 400k, whichever year it lands in, not a
+            today's-money figure scaled up by however much inflation has
+            accrued by then. Recurring events are quoted in today's euros
+            and inflate like everything else, since a repeating real-world
+            cost (e.g. a car every 5 years) does tend to rise over time.
 
     Returns:
         schedule (np.array): length-`time` nominal cashflow per year.
@@ -707,22 +856,31 @@ def build_life_cashflow_schedule(
         active = (years >= retirement_year) & (years >= gesetzliche_rente_start_year)
         real_cashflow = real_cashflow + active * gesetzliche_rente
 
-    if betriebliche_rente_start_year is not None:
-        active = (years >= retirement_year) & (years >= betriebliche_rente_start_year)
-        real_cashflow = real_cashflow + active * betriebliche_rente
-
+    one_time_events = []
     if events:
         for year_offset, amount, repeat_every, until_year in events:
             if repeat_every:
                 last = until_year if until_year is not None else time
                 years_hit = np.arange(year_offset, last, repeat_every)
+                for y in years_hit:
+                    if 0 <= y < time:
+                        real_cashflow[int(y)] += amount
             else:
-                years_hit = [year_offset]
-            for y in years_hit:
-                if 0 <= y < time:
-                    real_cashflow[int(y)] += amount
+                one_time_events.append((year_offset, amount))
 
-    return real_cashflow * inflation_factor
+    nominal_cashflow = real_cashflow * inflation_factor
+
+    for y, amount in one_time_events:
+        if 0 <= y < time:
+            nominal_cashflow[int(y)] += amount
+
+    if betriebliche_rente_start_year is not None:
+        active = (years >= retirement_year) & (years >= betriebliche_rente_start_year)
+        actual_start_year = max(retirement_year, betriebliche_rente_start_year)
+        frozen_betriebliche = betriebliche_rente * (1 + 0.01 * inflation_value) ** actual_start_year
+        nominal_cashflow = nominal_cashflow + active * frozen_betriebliche
+
+    return nominal_cashflow
 
 
 def _bisect_for_probability(evaluate, target, lo, hi, tol, max_iter,
@@ -953,6 +1111,7 @@ def solve_retirement_age(
         tax=25,
         tax_free_allowance=GERMAN_TAX_FREE_ALLOWANCE,
         asset_allocation=70,
+        retirement_stock_alloc=None,
         rebalance=True,
         rebalance_threshold=5,
         pdf="studentt",
@@ -990,6 +1149,12 @@ def solve_retirement_age(
             portfolio (%).
         accumulation_savings, retirement_spending: see
             build_life_cashflow_schedule.
+        asset_allocation (float): Stock allocation (%) while working.
+        retirement_stock_alloc (float): Optional stock allocation (%) from
+            retirement onward, if different from asset_allocation — a
+            two-phase glidepath (see build_two_phase_allocation). None
+            (default) keeps a single constant allocation throughout, same as
+            before this parameter existed.
         gesetzliche_rente_start_age / betriebliche_rente_start_age (int):
             Absolute ages, converted to year-offsets internally. A pension
             still only applies from retirement onward even if its own start
@@ -1037,9 +1202,16 @@ def solve_retirement_age(
             ),
             events=life_events,
         )
+        allocation_schedule = (
+            build_two_phase_allocation(
+                time, ry, 0.01 * asset_allocation, 0.01 * retirement_stock_alloc
+            )
+            if retirement_stock_alloc is not None else None
+        )
         runs, _, _ = run_simulations(
             n=n, time=time, starting_capital=starting_capital,
             yearly_invest=0, cashflow_schedule=schedule,
+            allocation_schedule=allocation_schedule,
             inflation_value=inflation_value, tax=tax,
             tax_free_allowance=tax_free_allowance,
             asset_allocation=asset_allocation, rebalance=rebalance,
@@ -1400,56 +1572,120 @@ def plot_simulations(year,
     return fig
 
 
-def plot_allocation_sweep(alloc_results, metric_fn, metric_label, current_allocation):
+def plot_allocation_sweep(alloc_results, current_allocation, goal_metric_fn=None,
+                           goal_metric_label=None, low_pct=10, high_pct=90):
     """
-    Plot a metric (e.g. success probability, median final value) against
-    stock allocation, from a sweep_allocation() result.
+    Plot the risk/return tradeoff of final portfolio value against stock
+    allocation, from a sweep_allocation() result: the median final value
+    plus a shaded low_pct-high_pct band. A median-only (or single
+    success-probability-only) summary hides the fact that a higher stock
+    share typically raises the median outcome while also widening the
+    downside — this band makes that tradeoff visible directly.
 
     Parameters:
         alloc_results (list of (allocation, runs)): Output of
             sweep_allocation().
-        metric_fn (callable): Maps a batch of runs to a single scalar
-            (e.g. lambda runs: np.mean(~ever_depleted(runs))).
-        metric_label (str): Y-axis / hover label for the metric, e.g.
-            "Chance of never depleting the portfolio (%)".
         current_allocation (float): The allocation actually used in the
             main result, marked with a vertical line for reference.
+        goal_metric_fn (callable, optional): Maps a batch of runs to a
+            single scalar percentage (e.g. lambda runs:
+            np.mean(~ever_depleted(runs)) * 100) — the solved-goal success
+            probability for the savings/withdrawal/life-goal modes.
+            Overlaid as its own line on a secondary axis when given.
+        goal_metric_label (str, optional): Label for the goal metric line
+            and its axis. Required if goal_metric_fn is given.
+        low_pct, high_pct (float): Percentiles of final value to shade
+            between.
 
     Returns:
         fig (plotly.graph_objects.Figure)
     """
     allocations = [alloc for alloc, _ in alloc_results]
-    metric_values = [metric_fn(runs) for _, runs in alloc_results]
+    finals = [np.array([r[-1] for r in runs]) for _, runs in alloc_results]
+    lo_vals = [float(np.percentile(f, low_pct)) for f in finals]
+    mid_vals = [float(np.percentile(f, 50)) for f in finals]
+    hi_vals = [float(np.percentile(f, high_pct)) for f in finals]
 
-    fig = go.Figure()
+    fig = make_subplots(specs=[[{"secondary_y": goal_metric_fn is not None}]])
 
     fig.add_trace(
         go.Scatter(
+            x=allocations + allocations[::-1],
+            y=hi_vals + lo_vals[::-1],
+            fill="toself",
+            fillcolor="rgba(0,0,128,0.12)",
+            line=dict(color="rgba(255,255,255,0)"),
+            hoverinfo="skip",
+            name=f"{low_pct}-{high_pct}% range",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
             x=allocations,
-            y=metric_values,
+            y=mid_vals,
             mode="lines+markers",
             line=dict(color="navy", width=2),
-            marker=dict(size=7),
-            name=metric_label,
-            hovertemplate=f"Stocks: %{{x}}%<br>{metric_label}: %{{y:,.2f}}<extra></extra>",
-        )
+            marker=dict(size=6),
+            name="Median final value",
+            hovertemplate="Stocks: %{x}%<br>Median: %{y:,.0f} €<extra></extra>",
+        ),
+        secondary_y=False,
     )
+    fig.add_trace(
+        go.Scatter(
+            x=allocations,
+            y=lo_vals,
+            mode="lines",
+            line=dict(color="firebrick", width=1, dash="dot"),
+            name=f"{low_pct}th percentile (downside)",
+            hovertemplate="Stocks: %{x}%<br>" + f"P{low_pct}: " + "%{y:,.0f} €<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=allocations,
+            y=hi_vals,
+            mode="lines",
+            line=dict(color="seagreen", width=1, dash="dot"),
+            name=f"{high_pct}th percentile (upside)",
+            hovertemplate="Stocks: %{x}%<br>" + f"P{high_pct}: " + "%{y:,.0f} €<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+
+    if goal_metric_fn is not None:
+        goal_values = [goal_metric_fn(runs) for _, runs in alloc_results]
+        fig.add_trace(
+            go.Scatter(
+                x=allocations,
+                y=goal_values,
+                mode="lines+markers",
+                line=dict(color="darkorange", width=2, dash="dash"),
+                marker=dict(size=6, symbol="diamond"),
+                name=goal_metric_label,
+                hovertemplate=f"Stocks: %{{x}}%<br>{goal_metric_label}: %{{y:,.1f}}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+        fig.update_yaxes(title_text=goal_metric_label, secondary_y=True, range=[0, 100])
 
     fig.add_vline(
         x=current_allocation,
         line_width=1,
         line_dash="dash",
-        line_color="firebrick",
+        line_color="gray",
         annotation_text="Current allocation",
         annotation_position="top",
     )
 
+    fig.update_yaxes(title_text="Final portfolio value [€]", secondary_y=False)
     fig.update_layout(
-        height=350,
+        height=380,
         margin=dict(l=40, r=40, t=30, b=40),
         xaxis=dict(title="Stock allocation [%]", range=[0, 100]),
-        yaxis=dict(title=metric_label),
-        showlegend=False,
+        legend=dict(orientation="h", y=-0.25),
     )
 
     return fig
