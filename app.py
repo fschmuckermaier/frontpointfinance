@@ -29,6 +29,9 @@ from functions import (
     GKV_ZUSATZBEITRAG_AVG,
     DEFAULT_INFLATION_STD,
     DEFAULT_INFLATION_PHI,
+    GUARDRAIL_MIN_MULTIPLIER,
+    GUARDRAIL_MAX_MULTIPLIER,
+    CRASH_MEAN_MAGNITUDE,
 )
 
 if "results" not in st.session_state:
@@ -487,6 +490,19 @@ with st.sidebar:
         rebalance_threshold = st.slider("...via savings/withdrawals if allocation is off more than [%]", 0, 15, 5, 1, key="rebalance_threshold")
         crash = st.checkbox("Include random market crashes?", True, key="crash")
         crash_prob = st.slider("Crash probability per year [%]", 1, 10, 3, 1, key="crash_prob", help="A crash year samples a one-year loss between -20% and -50%.")
+        if crash:
+            _effective_return = (
+                (1 - 0.01 * crash_prob) * average_annual_return
+                + 0.01 * crash_prob * (100 * CRASH_MEAN_MAGNITUDE)
+            )
+            st.caption(
+                f"With crashes on, your {average_annual_return:.1f}% stock return input blends "
+                f"down to an **≈{_effective_return:.1f}% effective expected return** "
+                f"({crash_prob}%/yr chance of a ~{-100*CRASH_MEAN_MAGNITUDE:.0f}% crash year). "
+                f"This is intentional conservatism — a long-run historical average already "
+                f"includes crash years, so treat the input above as the *calm-year* return, not "
+                f"the blended one."
+            )
 
     with st.expander("🔬 Expert: tax details & simulation internals", expanded=False):
         n = st.slider("Number of simulations", 100, 10000, 1000, 100, key="n", help="More simulations = smoother percentiles but slower runs.")
@@ -590,7 +606,7 @@ if run_clicked:
         progress.progress(p)
 
     if mode == MODE_MANUAL:
-        runs, comp_run, capital_run, inflation_factors = run_simulations(
+        runs, comp_run, capital_run, inflation_factors, _ = run_simulations(
             n=n,
             yearly_invest=yearly_invest,
             progress_callback=update_progress,
@@ -629,7 +645,7 @@ if run_clicked:
         # Reuse the solver's own converged batch for the chart (n=1 just to get the
         # deterministic baselines), so the plotted percentiles always agree with the
         # probability quoted above instead of a differently-sampled fresh batch.
-        _, comp_run, capital_run, _ = run_simulations(
+        _, comp_run, capital_run, _, _ = run_simulations(
             n=1,
             yearly_invest=solved_savings,
             **shared_kwargs,
@@ -670,7 +686,7 @@ if run_clicked:
         # Reuse the solver's own converged batch for the chart (n=1 just to get the
         # deterministic baselines), so the plotted percentiles always agree with the
         # probability quoted above instead of a differently-sampled fresh batch.
-        _, comp_run, capital_run, _ = run_simulations(
+        _, comp_run, capital_run, _, _ = run_simulations(
             n=1,
             yearly_invest=-solved_withdrawal,
             **shared_kwargs,
@@ -806,7 +822,7 @@ if run_clicked:
             # Always deterministic inflation here, even if the checkbox below is
             # on: solve_retirement_age itself doesn't support stochastic inflation
             # (see the Advanced-panel caption shown in this mode).
-            _, comp_run, capital_run, _ = run_simulations(
+            _, comp_run, capital_run, _, _ = run_simulations(
                 n=1,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
@@ -817,6 +833,7 @@ if run_clicked:
                 **shared_kwargs,
             )
             inflation_factors = None
+            spending_multiplier_paths = None
         else:
             # Ingredients to rebuild the schedule fresh per path from that
             # path's own realized inflation, when stochastic_inflation is on
@@ -843,7 +860,7 @@ if run_clicked:
             else:
                 guardrail_base_schedule, guardrail_pension_schedule = None, None
 
-            runs, comp_run, capital_run, inflation_factors = run_simulations(
+            runs, comp_run, capital_run, inflation_factors, spending_multiplier_paths = run_simulations(
                 n=n,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
@@ -869,6 +886,7 @@ if run_clicked:
             "comp_run": comp_run,
             "capital_run": capital_run,
             "inflation_factors": inflation_factors,
+            "spending_multiplier_paths": spending_multiplier_paths,
             "time": time,
             "starting_capital": starting_capital,
             "mode": "life",
@@ -1019,6 +1037,27 @@ if st.session_state.results is not None:
             depletion_fig = plot_depletion_age_histogram(ages_at_depletion, x_label.lower())
             if depletion_fig is not None:
                 st.plotly_chart(depletion_fig, use_container_width=True)
+
+    # --- Adaptive-spending (guardrail) realized-outcome reporting ---
+    # A bankruptcy probability alone hides the guardrail's own cost: "never
+    # runs out" can still mean years spent well below the planned spending
+    # level. Report what actually happened to spending, not just to the
+    # portfolio.
+    if res.get("mode") == "life" and res.get("guardrail_enabled") and res.get("spending_multiplier_paths"):
+        mult_paths = res["spending_multiplier_paths"]
+        avg_mult_per_path = np.array([np.nanmean(mp) for mp in mult_paths])
+        min_mult_per_path = np.array([np.nanmin(mp) for mp in mult_paths])
+        years_below_90 = np.array([np.nansum(mp < 0.9) for mp in mult_paths])
+        pct_hit_floor = 100 * np.mean(min_mult_per_path <= GUARDRAIL_MIN_MULTIPLIER + 1e-9)
+        pct_5yr_below_90 = 100 * np.mean(years_below_90 >= 5)
+        median_avg_mult = np.median(avg_mult_per_path)
+        st.caption(
+            f"**Adaptive spending in practice:** across all paths, the lifetime-average "
+            f"spending was **{median_avg_mult*100:.0f}%** of plan (median). It hit its floor "
+            f"({GUARDRAIL_MIN_MULTIPLIER*100:.0f}% of plan) at some point in "
+            f"**{pct_hit_floor:.1f}%** of paths, and **{pct_5yr_below_90:.1f}%** of paths spent "
+            f"5+ years below 90% of planned spending."
+        )
 
     col1, col2, col3 = st.columns([0.75, 11.5, 5])  # center col2
 

@@ -266,8 +266,8 @@ def resolve_net_pension_streams(current_age, retirement_age,
     )
 
 
-GUARDRAIL_MIN_MULTIPLIER = 0.5  # adaptive spending never cuts below 50% of the original plan
-GUARDRAIL_MAX_MULTIPLIER = 1.5  # ...or raises above 150% of it
+GUARDRAIL_MIN_MULTIPLIER = 0.8  # adaptive spending never cuts below 80% of the original plan
+GUARDRAIL_MAX_MULTIPLIER = 1.2  # ...or raises above 120% of it
 
 STUDENT_T_DF = 5  # degrees of freedom for the stock-return innovation distribution
 
@@ -545,7 +545,10 @@ def annual_return(pdf, price_return, std):
     return yr_return
     
 
-def sample_crash_magnitude(mean=-0.35, std=0.10, lower=-0.50, upper=-0.20):
+CRASH_MEAN_MAGNITUDE = -0.35  # default mean one-year crash return (see sample_crash_magnitude)
+
+
+def sample_crash_magnitude(mean=CRASH_MEAN_MAGNITUDE, std=0.10, lower=-0.50, upper=-0.20):
     """
     Sample a crash magnitude (negative return) from a truncated normal distribution.
     
@@ -753,9 +756,10 @@ def run_simulation_portfolio(
                 through unchanged, but from the first year it goes negative
                 onward, its magnitude is scaled by an adaptive
                 spending_multiplier (ratchets down by guardrail_adjust_pct
-                when this year's withdrawal rate — spending relative to the
-                *current* portfolio value — drifts guardrail_band_pct above
-                the first year's rate, up when it drifts that far below;
+                when this year's withdrawal rate — spending *net of that
+                year's pension/event income* relative to the current
+                portfolio value — drifts guardrail_band_pct above the first
+                spending year's net rate, up when it drifts that far below;
                 clamped to [GUARDRAIL_MIN_MULTIPLIER,
                 GUARDRAIL_MAX_MULTIPLIER]) before guardrail_pension_schedule
                 is added back on top, unadjusted. Modelling a retiree who
@@ -777,6 +781,9 @@ def run_simulation_portfolio(
 
         Returns:
             portfolio_values (list): Total portfolio value each year (length time+1).
+            spending_multiplier_path (np.array): Length-`time` array of the
+                guardrail's spending_multiplier on each spending year, NaN
+                elsewhere. All-NaN when guardrail_base_schedule is None.
         """
 
         initial_alloc = (
@@ -800,6 +807,7 @@ def run_simulation_portfolio(
         prev_year_taxable_capital_income = 0.0  # drives this year's gap-phase GKV premium (one-year lag)
         spending_multiplier = 1.0
         initial_withdrawal_rate = None  # set on the first spending (base < 0) year
+        spending_multiplier_path = np.full(int(time), np.nan)  # NaN on non-spending years
 
 
         effective_threshold = 0.01 * rebalance_threshold if rebalance else 1.0
@@ -812,12 +820,23 @@ def run_simulation_portfolio(
                 if base_amount < 0:
                     portfolio_at_start = portfolio_values[-1]
                     full_spending = -base_amount
+                    # Rate is measured net of pension/event income — what
+                    # actually has to come out of the portfolio — so a Rente
+                    # starting (or a windfall) reads as immediate relief to
+                    # the guardrail, not just indirectly via the portfolio
+                    # growth it causes over later years. Without this, a
+                    # gross-spending rate stays elevated for years after a
+                    # pension kicks in (since the numerator never reflects
+                    # the pension covering most of it), while the sticky
+                    # +/-10%/yr multiplier only claws back slowly.
+                    net_strain = max(0.0, full_spending - pension_amount)
                     if initial_withdrawal_rate is None:
                         initial_withdrawal_rate = (
-                            full_spending / portfolio_at_start if portfolio_at_start > 0 else 0.0
+                            net_strain / portfolio_at_start if portfolio_at_start > 0 else 0.0
                         )
+                    current_net_strain = max(0.0, full_spending * spending_multiplier - pension_amount)
                     current_rate = (
-                        (full_spending * spending_multiplier) / portfolio_at_start
+                        current_net_strain / portfolio_at_start
                         if portfolio_at_start > 0 else float("inf")
                     )
                     band = 0.01 * guardrail_band_pct
@@ -831,6 +850,7 @@ def run_simulation_portfolio(
                             spending_multiplier = min(
                                 spending_multiplier * (1 + adjust), GUARDRAIL_MAX_MULTIPLIER
                             )
+                    spending_multiplier_path[year] = spending_multiplier
                     infl_adj_yearly_invest = -(full_spending * spending_multiplier) + pension_amount
                 else:
                     infl_adj_yearly_invest = base_amount + pension_amount
@@ -1056,7 +1076,7 @@ def run_simulation_portfolio(
                 portfolio_values.extend([0] * (int(time) - year - 1))
                 break
 
-        return portfolio_values
+        return portfolio_values, spending_multiplier_path
 
 
 def run_simulations(n=1000,
@@ -1143,10 +1163,16 @@ def run_simulations(n=1000,
             per path.
         guardrail_base_schedule, guardrail_pension_schedule,
         guardrail_band_pct, guardrail_adjust_pct: see
-            run_simulation_portfolio's guardrail_* params — forwarded as-is
-            to every path (built once at the mean inflation rate, even if
-            stochastic_inflation is also on — a deliberate simplification,
-            see build_life_cashflow_schedule/base_life_cashflow). None
+            run_simulation_portfolio's guardrail_* params. When
+            stochastic_inflation is also on, both schedules are rebuilt
+            fresh per path from that path's own drawn inflation (via
+            base_life_cashflow, using cashflow_builder_kwargs' time/
+            retirement_year/accumulation_savings/retirement_spending)
+            instead of reusing the single mean-inflation schedule passed
+            in here — otherwise a high-inflation path would never raise
+            nominal spending, since only the *pension* schedule inflates
+            with the drawn path while the *base* stayed frozen at the mean
+            rate, defeating the guardrail's own adaptiveness. None
             (default) leaves every path's cashflow entirely determined by
             cashflow_schedule/cashflow_builder_kwargs, unchanged from
             before this parameter existed.
@@ -1170,13 +1196,19 @@ def run_simulations(n=1000,
             results to real terms — only when stochastic_inflation is
             True, else None (nothing path-specific to report; deflate by
             the ordinary constant-rate formula instead).
+        spending_multiplier_paths (list of np.array, or None): One
+            length-`time` guardrail spending_multiplier array per path (see
+            run_simulation_portfolio), letting a caller report how much the
+            guardrail actually cut/raised spending rather than just the
+            final portfolio outcome — only when guardrail_base_schedule is
+            given, else None.
     """
 
     # Convert percentage:
     target_stock_allocation=asset_allocation*0.01
 
     # Run path with zero volatility:
-    comp_run = run_simulation_portfolio(
+    comp_run, _ = run_simulation_portfolio(
         starting_capital=starting_capital,
         time=time,
         target_stock_allocation=target_stock_allocation,
@@ -1205,7 +1237,7 @@ def run_simulations(n=1000,
     )
 
     # Compute change of capital without any returns or volatility. Just savings / withdrawals:
-    capital_run = run_simulation_portfolio(
+    capital_run, _ = run_simulation_portfolio(
         starting_capital=starting_capital,
         time=time,
         target_stock_allocation=target_stock_allocation,
@@ -1236,6 +1268,7 @@ def run_simulations(n=1000,
     # Compute portfolio development:
     runs = []
     inflation_factors = [] if stochastic_inflation else None
+    spending_multiplier_paths = [] if guardrail_base_schedule is not None else None
     infl_mean = inflation_mean if inflation_mean is not None else inflation_value
 
     for i in range(n):
@@ -1261,12 +1294,30 @@ def run_simulations(n=1000,
                 path_inflation_factor[-1] * (1 + 0.01 * path_inflation[-1]),
             )
             inflation_factors.append(full_inflation_factor)
+
+            if guardrail_base_schedule is not None:
+                # Rebuild the guardrail's base/pension split from this
+                # path's own drawn inflation instead of reusing the single
+                # mean-inflation schedule — see the guardrail_base_schedule
+                # docstring above for why.
+                path_base_real, path_base_factor = base_life_cashflow(
+                    time, path_inflation,
+                    cashflow_builder_kwargs["retirement_year"],
+                    cashflow_builder_kwargs["accumulation_savings"],
+                    cashflow_builder_kwargs["retirement_spending"],
+                )
+                path_guardrail_base = path_base_real * path_base_factor
+                path_guardrail_pension = path_cashflow_schedule - path_guardrail_base
+            else:
+                path_guardrail_base, path_guardrail_pension = None, None
         else:
             path_cashflow_schedule = cashflow_schedule
             path_inflation_factor = None
+            path_guardrail_base = guardrail_base_schedule
+            path_guardrail_pension = guardrail_pension_schedule
 
         # Run one portfolio simulation path
-        sim = run_simulation_portfolio(
+        sim, sim_spending_multiplier = run_simulation_portfolio(
             starting_capital=starting_capital,
             time=time,
             target_stock_allocation=target_stock_allocation,
@@ -1289,8 +1340,8 @@ def run_simulations(n=1000,
             gkv_gap_schedule=gkv_gap_schedule,
             gkv_zusatzbeitrag=gkv_zusatzbeitrag,
             childless=childless,
-            guardrail_base_schedule=guardrail_base_schedule,
-            guardrail_pension_schedule=guardrail_pension_schedule,
+            guardrail_base_schedule=path_guardrail_base,
+            guardrail_pension_schedule=path_guardrail_pension,
             guardrail_band_pct=guardrail_band_pct,
             guardrail_adjust_pct=guardrail_adjust_pct,
             pdf_stocks=pdf,
@@ -1300,12 +1351,14 @@ def run_simulations(n=1000,
         )
 
         runs.append(sim)
+        if spending_multiplier_paths is not None:
+            spending_multiplier_paths.append(sim_spending_multiplier)
 
         # Update progress bar callback if provided
         if progress_callback is not None:
             progress_callback((i + 1) / n)
 
-    return runs, comp_run, capital_run, inflation_factors
+    return runs, comp_run, capital_run, inflation_factors, spending_multiplier_paths
 
 
 def sweep_allocation(allocations, n, seeds=None, progress_callback=None, **kwargs):
@@ -1338,7 +1391,7 @@ def sweep_allocation(allocations, n, seeds=None, progress_callback=None, **kwarg
 
     results = []
     for i, alloc in enumerate(allocations):
-        runs, _, _, _ = run_simulations(n=n, asset_allocation=alloc, seeds=seeds, **kwargs)
+        runs, _, _, _, _ = run_simulations(n=n, asset_allocation=alloc, seeds=seeds, **kwargs)
         results.append((alloc, runs))
         if progress_callback is not None:
             progress_callback((i + 1) / len(allocations))
@@ -1630,7 +1683,7 @@ def solve_required_savings(
     tol = max(1.0, 0.0005 * hi)
 
     def evaluate(yearly_invest):
-        runs, _, _, _ = run_simulations(
+        runs, _, _, _, _ = run_simulations(
             n=n, time=time, starting_capital=starting_capital,
             yearly_invest=yearly_invest, inflation_value=inflation_value,
             tax=tax, tax_free_allowance=tax_free_allowance,
@@ -1708,7 +1761,7 @@ def solve_max_withdrawal(
     tol = max(1.0, 0.0005 * starting_capital)
 
     def evaluate(withdrawal):
-        runs, _, _, _ = run_simulations(
+        runs, _, _, _, _ = run_simulations(
             n=n, time=time, starting_capital=starting_capital,
             yearly_invest=-withdrawal, inflation_value=inflation_value,
             tax=tax, tax_free_allowance=tax_free_allowance,
@@ -1876,7 +1929,7 @@ def solve_retirement_age(
             )
             if model_gkv_gap else None
         )
-        runs, _, _, _ = run_simulations(
+        runs, _, _, _, _ = run_simulations(
             n=n, time=time, starting_capital=starting_capital,
             yearly_invest=0, cashflow_schedule=schedule,
             allocation_schedule=allocation_schedule,
