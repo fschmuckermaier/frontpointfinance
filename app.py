@@ -14,12 +14,21 @@ from functions import (
     solve_retirement_age,
     sweep_allocation,
     plot_allocation_sweep,
+    plot_depletion_age_histogram,
     build_life_cashflow_schedule,
     build_two_phase_allocation,
+    build_gkv_gap_schedule,
+    base_life_cashflow,
+    solve_gesetzliche_rente_gross,
+    resolve_net_pension_streams,
     ever_depleted,
+    depletion_age,
     GERMAN_TAX_FREE_ALLOWANCE,
     GERMAN_SOLI_RATE,
     GERMAN_TEILFREISTELLUNG_EQUITY,
+    GKV_ZUSATZBEITRAG_AVG,
+    DEFAULT_INFLATION_STD,
+    DEFAULT_INFLATION_PHI,
 )
 
 if "results" not in st.session_state:
@@ -267,21 +276,44 @@ with st.sidebar:
         accumulation_savings = st.slider("Annual savings while working [€, today's money]", 0, 200_000, 15_000, 500, key="accumulation_savings")
         retirement_spending = st.slider("Desired annual retirement spending [€, today's money]", 0, 200_000, 30_000, 500, key="retirement_spending")
 
+        # Earliest legal claiming age is 63 (with Abschlag), regardless of
+        # how early retirement_age itself is set.
+        gesetzliche_claim_floor = min(max(63, pension_age_lower_bound), plan_until_age)
+
         col_g, col_b = st.columns(2)
         with col_g:
             st.markdown("**Gesetzliche Rente**", help="Germany's state pension")
-            gesetzliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 18_000, 500, key="gesetzliche_amount")
+            versicherungsjahre_bisher = st.number_input(
+                "Years contributed so far (Versicherungsjahre)",
+                min_value=0, max_value=current_age, value=max(current_age - 25, 0), step=1,
+                key="versicherungsjahre_bisher",
+            )
+            rente_at_nra_gross = st.slider(
+                "Projected gross Rente at age 67 [€/yr, today's money]", 0, 60_000, 18_000, 500,
+                key="rente_at_nra_gross",
+                help=(
+                    "From your Renteninformation: the Regelaltersrente you'd get if you kept "
+                    "contributing until 67. Stopping earlier reduces this (fewer Entgeltpunkte "
+                    "years); claiming before 67 adds the 0.3%/month Abschlag on top."
+                ),
+            )
             gesetzliche_rente_age = st.slider(
-                "Start age", pension_age_lower_bound, plan_until_age,
-                min(max(67, pension_age_lower_bound), plan_until_age), 1, key="gesetzliche_age",
+                "Start age (claiming)", gesetzliche_claim_floor, plan_until_age,
+                min(max(67, gesetzliche_claim_floor), plan_until_age), 1, key="gesetzliche_age",
             )
         with col_b:
             st.markdown("**Betriebliche Rente**", help="Employer-provided occupational pension")
-            betriebliche_rente = st.slider("Amount [€/yr, today's money]", 0, 60_000, 0, 500, key="betriebliche_amount")
+            betriebliche_rente = st.slider("Amount, gross [€/yr, today's money]", 0, 60_000, 0, 500, key="betriebliche_amount")
             betriebliche_rente_age = st.slider(
                 "Start age", pension_age_lower_bound, plan_until_age,
                 min(max(65, pension_age_lower_bound), plan_until_age), 1, key="betriebliche_age",
             )
+        st.caption(
+            "Both pensions are shown gross — we estimate net income after mandatory health "
+            "insurance (KVdR) and income tax, using the Rentenbesteuerung schedule (84% taxable "
+            "for a Rentenbeginn in 2026, rising toward 100% by 2058) and a simplified Regelaltersgrenze "
+            "of 67 (accurate for birth years 1964+; slightly earlier for older cohorts, not modeled)."
+        )
 
         st.markdown("**One-off & recurring events** (e.g. house purchase, inheritance, car)")
 
@@ -327,6 +359,24 @@ with st.sidebar:
             })
             st.rerun()
 
+        care_cost_default_age = min(max(85, current_age), plan_until_age)
+        if st.button("🏥 Add a care-cost stress test"):
+            st.session_state.life_events_list.append({
+                "age": care_cost_default_age,
+                "amount": -13_800.0,
+                "repeat_every": 1,
+                "until_age": None,
+            })
+            st.rerun()
+        st.caption(
+            "Adds a recurring -13,800 €/yr (today's money) from age "
+            f"{care_cost_default_age} onward — the national-average Pflegeheim "
+            "Eigenanteil (~3,245 €/month) net of the Pflegegrad-5 Pflegeversicherung "
+            "contribution (~2,096 €/month). Regional costs vary a lot and this ignores "
+            "the Entlastungsbetrag/Leistungszuschlag phase-in — edit the event below "
+            "once added if you want to refine it."
+        )
+
         for i, ev in enumerate(st.session_state.life_events_list):
             row_col1, row_col2 = st.columns([6, 1])
             with row_col1:
@@ -362,7 +412,62 @@ with st.sidebar:
 
     with st.expander("⚙️ Advanced: returns, costs & inflation", expanded=False):
         inflation_value = st.slider("Expected inflation [%/yr]", 0.0, 10.0, 2.0, 0.1, key="inflation_value")
-        start_year = st.slider("Simulation start year", 2026, 2100, 2026, 1, key="start_year")
+
+        life_manual_retirement = mode == MODE_LIFE and retirement_mode == "Set manually"
+        if life_manual_retirement:
+            stochastic_inflation = st.checkbox(
+                "Simulate inflation as random each year (instead of a fixed rate)?",
+                value=True, key="stochastic_inflation",
+                help=(
+                    "Each path draws its own year-by-year inflation rate (mean-reverting "
+                    "around the rate above) instead of everyone assuming the same fixed "
+                    "path. A mostly-derisked late-life portfolio is more exposed to "
+                    "inflation surprises than a constant-rate assumption can show."
+                ),
+            )
+            if stochastic_inflation:
+                inflation_std = st.slider(
+                    "Inflation volatility (year-to-year std. dev.) [pp]", 0.0, 5.0,
+                    DEFAULT_INFLATION_STD, 0.1, key="inflation_std",
+                )
+                inflation_phi = st.slider(
+                    "Inflation persistence (0 = no memory, close to 1 = slow-moving) ", 0.0, 0.95,
+                    DEFAULT_INFLATION_PHI, 0.05, key="inflation_phi",
+                )
+            else:
+                inflation_std, inflation_phi = DEFAULT_INFLATION_STD, DEFAULT_INFLATION_PHI
+
+            guardrail_enabled = st.checkbox(
+                "Cut/raise retirement spending in bad/good years (guardrail)?",
+                value=True, key="guardrail_enabled",
+                help=(
+                    "A real retiree adjusts spending rather than sticking to a fixed real "
+                    "amount no matter what. If this year's spending would exceed the band "
+                    "below relative to the *current* portfolio value, spending is cut by the "
+                    "adjustment %; if it's comfortably under, spending is raised back up (never "
+                    "beyond 150% of the original plan, never cut below 50% of it). Pensions and "
+                    "one-off events aren't touched — only the discretionary spending line is."
+                ),
+            )
+            if guardrail_enabled:
+                guardrail_band_pct = st.slider(
+                    "Guardrail band (± around the plan's starting withdrawal rate) [%]",
+                    5, 50, 20, 5, key="guardrail_band_pct",
+                )
+                guardrail_adjust_pct = st.slider(
+                    "Spending adjustment when triggered [%]", 5, 30, 10, 5, key="guardrail_adjust_pct",
+                )
+            else:
+                guardrail_band_pct, guardrail_adjust_pct = 20, 10
+        else:
+            stochastic_inflation, inflation_std, inflation_phi = False, DEFAULT_INFLATION_STD, DEFAULT_INFLATION_PHI
+            guardrail_enabled, guardrail_band_pct, guardrail_adjust_pct = False, 20, 10
+            if mode == MODE_LIFE:
+                st.caption(
+                    "Random year-by-year inflation and adaptive spending are only available "
+                    "when the retirement age is set manually (not when solving for the "
+                    "earliest possible age)."
+                )
 
         st.markdown("**Stocks**")
         st.caption("Default values for A1JX52")
@@ -399,6 +504,34 @@ with st.sidebar:
             "Tax-free allowance on gains (Sparer-Pauschbetrag) [€/yr]",
             0, 2000, GERMAN_TAX_FREE_ALLOWANCE, 100, key="tax_free_allowance",
         )
+
+        if mode == MODE_LIFE:
+            st.markdown("**Health insurance during the pre-pension gap**")
+            model_gkv_gap = st.checkbox(
+                "Model freiwillige GKV + Günstigerprüfung before gesetzliche Rente starts",
+                value=True, key="model_gkv_gap",
+                help=(
+                    "If you stop working before gesetzliche Rente starts, you're not yet "
+                    "a KVdR member: your portfolio's dividends and realized gains become "
+                    "subject to freiwillige-GKV contributions (health + long-term care "
+                    "insurance), but also become eligible for Günstigerprüfung — taxed at "
+                    "your personal rate (with the Grundfreibetrag) instead of the flat "
+                    "25% Abgeltungsteuer if that's cheaper. Both stop once gesetzliche "
+                    "Rente starts (assumes the 9/10 rule is met, i.e. mandatory KVdR)."
+                ),
+            )
+            if model_gkv_gap:
+                gkv_zusatzbeitrag = st.slider(
+                    "Krankenkasse Zusatzbeitrag [%]", 0.0, 5.0, GKV_ZUSATZBEITRAG_AVG, 0.1,
+                    key="gkv_zusatzbeitrag", help="Varies by Krankenkasse, roughly 2.2-4.4%.",
+                )
+                gkv_childless = st.checkbox(
+                    "Childless (higher Pflegeversicherung rate)", value=True, key="gkv_childless",
+                )
+            else:
+                gkv_zusatzbeitrag, gkv_childless = GKV_ZUSATZBEITRAG_AVG, False
+        else:
+            model_gkv_gap, gkv_zusatzbeitrag, gkv_childless = False, GKV_ZUSATZBEITRAG_AVG, False
 
 st.markdown(
     """
@@ -457,9 +590,8 @@ if run_clicked:
         progress.progress(p)
 
     if mode == MODE_MANUAL:
-        runs, comp_run, capital_run = run_simulations(
+        runs, comp_run, capital_run, inflation_factors = run_simulations(
             n=n,
-            start_year=start_year,
             yearly_invest=yearly_invest,
             progress_callback=update_progress,
             **shared_kwargs,
@@ -470,7 +602,7 @@ if run_clicked:
             "runs": runs,
             "comp_run": comp_run,
             "capital_run": capital_run,
-            "start_year": start_year,
+            "inflation_factors": inflation_factors,
             "time": time,
             "starting_capital": starting_capital,
             "mode": "manual",
@@ -497,9 +629,8 @@ if run_clicked:
         # Reuse the solver's own converged batch for the chart (n=1 just to get the
         # deterministic baselines), so the plotted percentiles always agree with the
         # probability quoted above instead of a differently-sampled fresh batch.
-        _, comp_run, capital_run = run_simulations(
+        _, comp_run, capital_run, _ = run_simulations(
             n=1,
-            start_year=start_year,
             yearly_invest=solved_savings,
             **shared_kwargs,
         )
@@ -508,7 +639,7 @@ if run_clicked:
             "runs": runs,
             "comp_run": comp_run,
             "capital_run": capital_run,
-            "start_year": start_year,
+            "inflation_factors": None,
             "time": time,
             "starting_capital": starting_capital,
             "mode": "savings_goal",
@@ -539,9 +670,8 @@ if run_clicked:
         # Reuse the solver's own converged batch for the chart (n=1 just to get the
         # deterministic baselines), so the plotted percentiles always agree with the
         # probability quoted above instead of a differently-sampled fresh batch.
-        _, comp_run, capital_run = run_simulations(
+        _, comp_run, capital_run, _ = run_simulations(
             n=1,
-            start_year=start_year,
             yearly_invest=-solved_withdrawal,
             **shared_kwargs,
         )
@@ -550,7 +680,7 @@ if run_clicked:
             "runs": runs,
             "comp_run": comp_run,
             "capital_run": capital_run,
-            "start_year": start_year,
+            "inflation_factors": None,
             "time": time,
             "starting_capital": starting_capital,
             "mode": "withdrawal_goal",
@@ -572,7 +702,8 @@ if run_clicked:
                 accumulation_savings=accumulation_savings,
                 retirement_spending=retirement_spending,
                 inflation_value=inflation_value,
-                gesetzliche_rente=gesetzliche_rente,
+                versicherungsjahre_bisher=versicherungsjahre_bisher,
+                rente_at_nra_gross=rente_at_nra_gross,
                 gesetzliche_rente_start_age=gesetzliche_rente_age,
                 betriebliche_rente=betriebliche_rente,
                 betriebliche_rente_start_age=betriebliche_rente_age,
@@ -593,6 +724,9 @@ if run_clicked:
                 ter_fi=ter_fi,
                 crash=crash,
                 crash_prob=crash_prob,
+                model_gkv_gap=model_gkv_gap,
+                gkv_zusatzbeitrag=gkv_zusatzbeitrag,
+                childless=gkv_childless,
                 n=solver_n,
                 max_iter=solver_max_iter,
                 progress_callback=update_progress,
@@ -610,15 +744,36 @@ if run_clicked:
             bracketed = None
 
         # retirement_age is now fixed (solved above, or set manually) either way.
+        # Resolve the gross gesetzliche Rente for this retirement age (fewer
+        # working years / an earlier claim both reduce it — see
+        # solve_gesetzliche_rente_gross), then net both pension streams of
+        # KVdR + income tax (see net_pension_income) before building the
+        # schedule, which expects already-net amounts.
+        gesetzliche_rente_gross = solve_gesetzliche_rente_gross(
+            current_age=current_age, retirement_age=retirement_age,
+            claiming_age=gesetzliche_rente_age,
+            versicherungsjahre_bisher=versicherungsjahre_bisher,
+            rente_at_nra_gross=rente_at_nra_gross,
+        )
+        net_gesetzliche_rente, net_betriebliche_rente = resolve_net_pension_streams(
+            current_age=current_age, retirement_age=retirement_age,
+            versicherungsjahre_bisher=versicherungsjahre_bisher,
+            rente_at_nra_gross=rente_at_nra_gross,
+            gesetzliche_rente_age=gesetzliche_rente_age,
+            betriebliche_rente_gross=betriebliche_rente,
+            betriebliche_rente_age=betriebliche_rente_age,
+            childless=gkv_childless,
+        )
+
         schedule = build_life_cashflow_schedule(
             time=time,
             inflation_value=inflation_value,
             retirement_year=retirement_age - current_age,
             accumulation_savings=accumulation_savings,
             retirement_spending=retirement_spending,
-            gesetzliche_rente=gesetzliche_rente,
+            gesetzliche_rente=net_gesetzliche_rente,
             gesetzliche_rente_start_year=gesetzliche_rente_age - current_age,
-            betriebliche_rente=betriebliche_rente,
+            betriebliche_rente=net_betriebliche_rente,
             betriebliche_rente_start_year=betriebliche_rente_age - current_age,
             events=life_events,
         )
@@ -634,26 +789,76 @@ if run_clicked:
             if retirement_stock_alloc is not None else None
         )
 
+        # Gap phase: retired but gesetzliche Rente hasn't started yet — empty
+        # (all False) if retirement_age >= gesetzliche_rente_age, i.e. no gap.
+        gkv_gap_schedule = (
+            build_gkv_gap_schedule(
+                time, retirement_age - current_age, gesetzliche_rente_age - current_age,
+            )
+            if model_gkv_gap else None
+        )
+
         if life_solving_retirement:
             # Reuse the solver's own converged batch for the chart (n=1 just to get
             # the deterministic baselines), so the plotted percentiles always agree
             # with the probability quoted above instead of a differently-sampled
             # fresh batch — same pattern as the savings/withdrawal-goal solvers.
-            _, comp_run, capital_run = run_simulations(
+            # Always deterministic inflation here, even if the checkbox below is
+            # on: solve_retirement_age itself doesn't support stochastic inflation
+            # (see the Advanced-panel caption shown in this mode).
+            _, comp_run, capital_run, _ = run_simulations(
                 n=1,
-                start_year=start_year,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
                 allocation_schedule=allocation_schedule,
+                gkv_gap_schedule=gkv_gap_schedule,
+                gkv_zusatzbeitrag=gkv_zusatzbeitrag,
+                childless=gkv_childless,
                 **shared_kwargs,
             )
+            inflation_factors = None
         else:
-            runs, comp_run, capital_run = run_simulations(
+            # Ingredients to rebuild the schedule fresh per path from that
+            # path's own realized inflation, when stochastic_inflation is on
+            # (see run_simulations). Unused otherwise.
+            cashflow_builder_kwargs = dict(
+                time=time,
+                retirement_year=retirement_age - current_age,
+                accumulation_savings=accumulation_savings,
+                retirement_spending=retirement_spending,
+                gesetzliche_rente=net_gesetzliche_rente,
+                gesetzliche_rente_start_year=gesetzliche_rente_age - current_age,
+                betriebliche_rente=net_betriebliche_rente,
+                betriebliche_rente_start_year=betriebliche_rente_age - current_age,
+                events=life_events,
+            )
+
+            if guardrail_enabled:
+                base_real, base_infl_factor = base_life_cashflow(
+                    time, inflation_value, retirement_age - current_age,
+                    accumulation_savings, retirement_spending,
+                )
+                guardrail_base_schedule = base_real * base_infl_factor
+                guardrail_pension_schedule = schedule - guardrail_base_schedule
+            else:
+                guardrail_base_schedule, guardrail_pension_schedule = None, None
+
+            runs, comp_run, capital_run, inflation_factors = run_simulations(
                 n=n,
-                start_year=start_year,
                 yearly_invest=0,
                 cashflow_schedule=schedule,
                 allocation_schedule=allocation_schedule,
+                gkv_gap_schedule=gkv_gap_schedule,
+                gkv_zusatzbeitrag=gkv_zusatzbeitrag,
+                childless=gkv_childless,
+                stochastic_inflation=stochastic_inflation,
+                inflation_std=inflation_std,
+                inflation_phi=inflation_phi,
+                cashflow_builder_kwargs=cashflow_builder_kwargs,
+                guardrail_base_schedule=guardrail_base_schedule,
+                guardrail_pension_schedule=guardrail_pension_schedule,
+                guardrail_band_pct=guardrail_band_pct,
+                guardrail_adjust_pct=guardrail_adjust_pct,
                 progress_callback=update_progress,
                 **shared_kwargs,
             )
@@ -663,7 +868,7 @@ if run_clicked:
             "runs": runs,
             "comp_run": comp_run,
             "capital_run": capital_run,
-            "start_year": start_year,
+            "inflation_factors": inflation_factors,
             "time": time,
             "starting_capital": starting_capital,
             "mode": "life",
@@ -672,14 +877,23 @@ if run_clicked:
             "retirement_age": retirement_age,
             "accumulation_savings": accumulation_savings,
             "retirement_spending": retirement_spending,
-            "gesetzliche_rente": gesetzliche_rente,
+            "versicherungsjahre_bisher": versicherungsjahre_bisher,
+            "rente_at_nra_gross": rente_at_nra_gross,
+            "gesetzliche_rente_gross": gesetzliche_rente_gross,
+            "gesetzliche_rente": net_gesetzliche_rente,
             "gesetzliche_rente_age": gesetzliche_rente_age,
-            "betriebliche_rente": betriebliche_rente,
+            "betriebliche_rente_gross": betriebliche_rente,
+            "betriebliche_rente": net_betriebliche_rente,
             "betriebliche_rente_age": betriebliche_rente_age,
             "life_events": life_events,
             "life_events_list": list(st.session_state.life_events_list),
             "asset_allocation": asset_allocation,
             "retirement_stock_alloc": retirement_stock_alloc,
+            "model_gkv_gap": model_gkv_gap and retirement_age < gesetzliche_rente_age,
+            "stochastic_inflation": stochastic_inflation and not life_solving_retirement,
+            "guardrail_enabled": guardrail_enabled and not life_solving_retirement,
+            "guardrail_band_pct": guardrail_band_pct,
+            "guardrail_adjust_pct": guardrail_adjust_pct,
             "retirement_solved": life_solving_retirement,
             "target_retirement_probability": target_retirement_probability if life_solving_retirement else None,
             "achieved_retirement_probability": achieved_prob,
@@ -714,10 +928,16 @@ if st.session_state.results is not None:
         )
     elif res["mode"] == "life":
         pension_bits = []
-        if res["gesetzliche_rente"] > 0:
-            pension_bits.append(f"gesetzliche Rente ({res['gesetzliche_rente']:,.0f} €/yr) from age {res['gesetzliche_rente_age']}")
-        if res["betriebliche_rente"] > 0:
-            pension_bits.append(f"betriebliche Rente ({res['betriebliche_rente']:,.0f} €/yr) from age {res['betriebliche_rente_age']}")
+        if res["gesetzliche_rente_gross"] > 0:
+            pension_bits.append(
+                f"gesetzliche Rente ({res['gesetzliche_rente']:,.0f} €/yr net, "
+                f"{res['gesetzliche_rente_gross']:,.0f} € gross) from age {res['gesetzliche_rente_age']}"
+            )
+        if res["betriebliche_rente_gross"] > 0:
+            pension_bits.append(
+                f"betriebliche Rente ({res['betriebliche_rente']:,.0f} €/yr net, "
+                f"{res['betriebliche_rente_gross']:,.0f} € gross) from age {res['betriebliche_rente_age']}"
+            )
         pension_text = " and ".join(pension_bits) if pension_bits else "no pension income"
         if res.get("retirement_stock_alloc") is not None:
             allocation_text = (
@@ -726,6 +946,20 @@ if st.session_state.results is not None:
             )
         else:
             allocation_text = ""
+        if res.get("model_gkv_gap"):
+            allocation_text += (
+                f" Includes freiwillige-GKV premiums and Günstigerprüfung tax relief "
+                f"for the years between retiring and gesetzliche Rente starting at "
+                f"{res['gesetzliche_rente_age']}."
+            )
+        if res.get("guardrail_enabled"):
+            allocation_text += (
+                f" Spending adapts: cut/raised by {res['guardrail_adjust_pct']:.0f}% whenever "
+                f"the withdrawal rate drifts more than {res['guardrail_band_pct']:.0f}% from "
+                f"the plan's starting rate."
+            )
+        if res.get("stochastic_inflation"):
+            allocation_text += " Inflation is simulated as random each year, not a fixed rate."
         if res["retirement_solved"]:
             st.success(
                 f"Earliest retirement age: **{res['retirement_age']}** gives a "
@@ -758,29 +992,64 @@ if st.session_state.results is not None:
     metric_cols[2].metric("Best case (top 10%)", f"{best_case:,.0f} €")
     metric_cols[3].metric("Chance you run out of money", f"{risk_of_running_out:.1f}%", delta=risk_badge, delta_color="off")
 
+    # x_start/x_label drive every age-or-year display below: a life-mode plan
+    # has a real age to anchor to, the other modes don't, so they fall back to
+    # a plain year-count from now.
+    if res["mode"] == "life":
+        x_start, x_label = res["current_age"], "Age"
+    else:
+        x_start, x_label = 0, "Year"
+
+    # --- Depletion-age reporting ---
+    # A fixed-horizon bankruptcy probability alone conflates a near-miss
+    # (fails one year before the horizon) with an early disaster — show
+    # *when* the paths that do fail actually run out.
+    ages_at_depletion = depletion_age(res["runs"], x_start)
+    n_depleted = int(np.sum(~np.isnan(ages_at_depletion)))
+
+    if n_depleted > 0:
+        valid_ages = ages_at_depletion[~np.isnan(ages_at_depletion)]
+        p25_age, median_age, p75_age = np.percentile(valid_ages, [25, 50, 75])
+        st.caption(
+            f"**When it fails:** among the {n_depleted} path{'s' if n_depleted != 1 else ''} "
+            f"that ever run out, it typically happens around {x_label.lower()} "
+            f"**{median_age:.0f}** (P25–P75: {p25_age:.0f}–{p75_age:.0f})."
+        )
+        with st.expander("Show depletion-age distribution", expanded=False):
+            depletion_fig = plot_depletion_age_histogram(ages_at_depletion, x_label.lower())
+            if depletion_fig is not None:
+                st.plotly_chart(depletion_fig, use_container_width=True)
+
     col1, col2, col3 = st.columns([0.75, 11.5, 5])  # center col2
 
     with col2:
-        end_year = int(start_year + res["time"])
-        year = st.slider(
-            "Year",
-            start_year,
-            end_year,
-            end_year,  # default to the final year: the bankruptcy stat covers
-                       # every year up to the one shown, so an earlier year
-                       # would understate lifetime risk
+        end_x = x_start + res["time"]
+        selected_x = st.slider(
+            x_label,
+            x_start,
+            end_x,
+            end_x,  # default to the final year: the bankruptcy stat covers
+                    # every year up to the one shown, so an earlier year
+                    # would understate lifetime risk
             1
         )
 
+    show_real = st.checkbox(
+        "Show chart in today's money (inflation-adjusted)", value=False, key="show_real",
+    )
+
     fig = plot_simulations(
-        year,
+        selected_x,
         res["runs"],
         res["comp_run"],
         res["capital_run"],
-        res["start_year"],
+        x_start,
         res["time"],
         res["starting_capital"],
         inflation_value,
+        x_label=x_label,
+        inflation_factors=res.get("inflation_factors"),
+        show_real=show_real,
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -892,8 +1161,10 @@ if st.session_state.results is not None:
         cashflow_lines = (
             f"Savings while working: {res['accumulation_savings']:,.0f} €/yr\n"
             f"Retirement spending: {res['retirement_spending']:,.0f} €/yr\n"
-            f"Gesetzliche Rente: {res['gesetzliche_rente']:,.0f} €/yr from age {res['gesetzliche_rente_age']}\n"
-            f"Betriebliche Rente: {res['betriebliche_rente']:,.0f} €/yr from age {res['betriebliche_rente_age']}\n"
+            f"Gesetzliche Rente: {res['gesetzliche_rente']:,.0f} €/yr net "
+            f"({res['gesetzliche_rente_gross']:,.0f} € gross) from age {res['gesetzliche_rente_age']}\n"
+            f"Betriebliche Rente: {res['betriebliche_rente']:,.0f} €/yr net "
+            f"({res['betriebliche_rente_gross']:,.0f} € gross) from age {res['betriebliche_rente_age']}\n"
             f"Retirement age: {res['retirement_age']}"
         )
         if res.get("retirement_stock_alloc") is not None:
@@ -908,7 +1179,7 @@ if st.session_state.results is not None:
         cashflow_lines = f"Yearly cashflow: {res['yearly_invest']:,.0f} €"
 
     param_lines = (
-        f"Simulations: {n} | Start year: {start_year} | Duration: {time} years\n"
+        f"Simulations: {n} | Duration: {time} years\n"
         f"Starting capital: {starting_capital:,.0f} €\n"
         f"{cashflow_lines}\n"
         f"Inflation: {inflation_value}% | Tax: {tax}% | Tax-free allowance: {tax_free_allowance:,.0f} €/yr\n\n"
@@ -937,7 +1208,6 @@ if st.session_state.results is not None:
     scenario_params = {
         "mode": mode,
         "n": n,
-        "start_year": start_year,
         "starting_capital": starting_capital,
         "inflation_value": inflation_value,
         "tax": tax,
@@ -976,7 +1246,8 @@ if st.session_state.results is not None:
         scenario_params["retirement_mode"] = retirement_mode
         scenario_params["accumulation_savings"] = accumulation_savings
         scenario_params["retirement_spending"] = retirement_spending
-        scenario_params["gesetzliche_amount"] = gesetzliche_rente
+        scenario_params["versicherungsjahre_bisher"] = versicherungsjahre_bisher
+        scenario_params["rente_at_nra_gross"] = rente_at_nra_gross
         scenario_params["gesetzliche_age"] = gesetzliche_rente_age
         scenario_params["betriebliche_amount"] = betriebliche_rente
         scenario_params["betriebliche_age"] = betriebliche_rente_age
@@ -990,6 +1261,10 @@ if st.session_state.results is not None:
         scenario_params["shift_allocation_at_retirement"] = shift_allocation_at_retirement
         if retirement_stock_alloc is not None:
             scenario_params["retirement_stock_alloc"] = retirement_stock_alloc
+        scenario_params["model_gkv_gap"] = model_gkv_gap
+        if model_gkv_gap:
+            scenario_params["gkv_zusatzbeitrag"] = gkv_zusatzbeitrag
+            scenario_params["gkv_childless"] = gkv_childless
 
     if st.button("💾 Prepare scenario export (JSON)"):
         st.session_state.scenario_export = json.dumps(scenario_params, indent=2)
@@ -1004,9 +1279,11 @@ if st.session_state.results is not None:
 
     # CSV of the percentile paths shown in the chart above.
     runs_array = np.array(res["runs"])
-    years_col = np.arange(res["start_year"], res["start_year"] + res["time"] + 1)
+    csv_x_col = "age" if res["mode"] == "life" else "year"
+    csv_x_start = res["current_age"] if res["mode"] == "life" else 0
+    x_col_values = np.arange(csv_x_start, csv_x_start + res["time"] + 1)
     percentile_df = pd.DataFrame({
-        "year": years_col,
+        csv_x_col: x_col_values,
         "p10": np.percentile(runs_array, 10, axis=0),
         "p25": np.percentile(runs_array, 25, axis=0),
         "p50_median": np.percentile(runs_array, 50, axis=0),
@@ -1038,8 +1315,8 @@ if st.session_state.results is not None:
                 cashflow_summary = f"""
             - Savings while working: `{res['accumulation_savings']:,.0f} €/yr`
             - Retirement spending: `{res['retirement_spending']:,.0f} €/yr`
-            - Gesetzliche Rente: `{res['gesetzliche_rente']:,.0f} €/yr` from age `{res['gesetzliche_rente_age']}`
-            - Betriebliche Rente: `{res['betriebliche_rente']:,.0f} €/yr` from age `{res['betriebliche_rente_age']}`
+            - Gesetzliche Rente: `{res['gesetzliche_rente']:,.0f} €/yr net` (`{res['gesetzliche_rente_gross']:,.0f} €` gross, `{res['versicherungsjahre_bisher']:.0f}` Vsj. so far) from age `{res['gesetzliche_rente_age']}`
+            - Betriebliche Rente: `{res['betriebliche_rente']:,.0f} €/yr net` (`{res['betriebliche_rente_gross']:,.0f} €` gross) from age `{res['betriebliche_rente_age']}`
             - Retirement age: `{res['retirement_age']}`{events_summary}"""
             else:
                 cashflow_summary = f"- Yearly cashflow: `{res['yearly_invest']:,.0f} €`"
@@ -1047,7 +1324,6 @@ if st.session_state.results is not None:
             st.markdown(f"""
             ### Simulation
             - Simulations: `{n}`
-            - Start year: `{start_year}`
             - Duration: `{time}` years
 
             ### Capital & Cashflows
